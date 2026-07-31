@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Uploaded bill images (keep the folder, ignore its contents)
+uploads/*
+!uploads/.gitkeep
