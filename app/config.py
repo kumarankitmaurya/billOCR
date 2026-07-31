@@ -11,11 +11,17 @@ load_dotenv()
 class Settings:
     """Central place for all configurable values."""
 
-    # Fallback API key used when the client doesn't supply one via the UI.
-    gemini_api_key: str | None = os.getenv("GEMINI_API_KEY")
+    # --- Provider API keys (set whichever ones you have) ---
 
-    # Gemini model used for structured bill extraction.
+    # Google Gemini
+    gemini_api_key: str | None = os.getenv("GEMINI_API_KEY")
     gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+
+    # Groq (free tier — Llama 3.2 Vision)
+    groq_api_key: str | None = os.getenv("GROQ_API_KEY")
+    groq_model: str = os.getenv("GROQ_MODEL", "llama-3.2-90b-vision-preview")
+
+    # --- General settings ---
 
     # Where uploaded bill images are temporarily written before OCR.
     upload_dir: str = os.getenv("UPLOAD_DIR", "uploads")

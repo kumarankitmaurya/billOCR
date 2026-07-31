@@ -1,7 +1,7 @@
 """Bill extraction using Google's Gemini Vision API.
 
-This is the primary OCR path: Gemini reads the bill image and returns JSON
-that already matches our `BillData` schema, so no manual text parsing is
+Gemini reads the bill image and returns JSON that already matches our
+`BillData` schema via structured output, so no manual text parsing is
 needed here (unlike the Tesseract fallback).
 """
 
@@ -26,7 +26,7 @@ def extract_bill_data(image_bytes: bytes, mime_type: str, api_key: str | None = 
     """Send a bill image to Gemini and return the parsed BillData.
 
     Raises whatever exception the SDK raises (e.g. auth or network errors)
-    so the caller can decide whether to fall back to Tesseract.
+    so the caller can decide whether to fall back to another provider.
     """
     key = api_key or settings.gemini_api_key
     if not key:

@@ -109,10 +109,47 @@ body {
   font-family: var(--font);
 }
 
+.settings-group {
+  margin-bottom: 1.2rem;
+}
+
+.settings-group:last-child {
+  margin-bottom: 0;
+}
+
+.select-input {
+  display: block;
+  width: 100%;
+  margin-top: 0.5rem;
+  padding: 0.65rem 0.9rem;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg-elevated);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 0.9rem;
+  appearance: auto;
+  cursor: pointer;
+}
+
+.select-input option {
+  background: var(--bg-elevated);
+  color: var(--text);
+}
+
 .hint {
   font-size: 0.8rem;
   color: var(--text-muted);
   margin: 0.6rem 0 0;
+}
+
+.hint a {
+  color: var(--accent-2);
+  text-decoration: none;
+}
+
+.hint a:hover {
+  text-decoration: underline;
 }
 
 /* ---------- Layout ---------- */
@@ -337,6 +374,11 @@ body {
 .engine-badge.gemini {
   background: rgba(124, 92, 255, 0.18);
   color: #b3a2ff;
+}
+
+.engine-badge.groq {
+  background: rgba(52, 211, 153, 0.15);
+  color: #6ee7b7;
 }
 
 .engine-badge.tesseract {

@@ -3,39 +3,51 @@
 import logging
 
 from fastapi import APIRouter, Form, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.models import ExtractionResult
-from app.services import excel_export, gemini_ocr, tesseract_ocr
+from app.services import excel_export
+from app.services.ocr_strategy import Provider, extract, available_providers
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/bills", tags=["bills"])
 
 
-async def _extract_one(file: UploadFile, api_key: str | None) -> ExtractionResult:
-    """Extract a single bill, preferring Gemini and falling back to Tesseract."""
-    image_bytes = await file.read()
+@router.get("/providers")
+async def list_providers() -> list[dict]:
+    """Return the available OCR providers so the frontend can build a dropdown."""
+    return available_providers()
 
-    try:
-        bill = gemini_ocr.extract_bill_data(image_bytes, file.content_type or "image/jpeg", api_key)
-        return ExtractionResult(source_filename=file.filename or "bill", engine="gemini", bill=bill)
-    except Exception as exc:
-        # Any Gemini failure (missing key, auth error, network issue, etc.)
-        # falls through to the local Tesseract path instead of failing the request.
-        logger.warning("Gemini extraction failed for %s, falling back to Tesseract: %s", file.filename, exc)
-        bill = tesseract_ocr.extract_bill_data(image_bytes)
-        return ExtractionResult(source_filename=file.filename or "bill", engine="tesseract", bill=bill)
+
+async def _extract_one(
+    file: UploadFile,
+    api_key: str | None,
+    provider: Provider = "auto",
+) -> ExtractionResult:
+    """Extract a single bill using the strategy module."""
+    image_bytes = await file.read()
+    return extract(
+        image_bytes=image_bytes,
+        mime_type=file.content_type or "image/jpeg",
+        filename=file.filename or "bill",
+        provider=provider,
+        api_key=api_key,
+    )
 
 
 @router.post("/preview")
-async def preview_bills(files: list[UploadFile], api_key: str | None = Form(None)) -> list[ExtractionResult]:
+async def preview_bills(
+    files: list[UploadFile],
+    api_key: str | None = Form(None),
+    provider: Provider = Form("auto"),
+) -> list[ExtractionResult]:
     """Extract structured data from one or more bills and return it as JSON
     so the UI can show a preview before the user commits to downloading."""
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
 
-    return [await _extract_one(file, api_key) for file in files]
+    return [await _extract_one(file, api_key, provider) for file in files]
 
 
 def _xlsx_response(results: list[ExtractionResult]) -> StreamingResponse:
@@ -54,7 +66,7 @@ async def build_workbook(results: list[ExtractionResult]) -> StreamingResponse:
 
     This is what the UI uses for its download button: it posts back the
     results it got from /preview instead of re-uploading the images, so a
-    preview-then-download flow costs exactly one Gemini call, not two.
+    preview-then-download flow costs exactly one OCR call, not two.
     """
     if not results:
         raise HTTPException(status_code=400, detail="No extraction results provided")
@@ -63,7 +75,11 @@ async def build_workbook(results: list[ExtractionResult]) -> StreamingResponse:
 
 
 @router.post("/extract")
-async def extract_bills(files: list[UploadFile], api_key: str | None = Form(None)) -> StreamingResponse:
+async def extract_bills(
+    files: list[UploadFile],
+    api_key: str | None = Form(None),
+    provider: Provider = Form("auto"),
+) -> StreamingResponse:
     """Extract bills and stream back a workbook in a single call.
 
     Convenience path for API clients that don't need a preview step; the UI
@@ -72,5 +88,5 @@ async def extract_bills(files: list[UploadFile], api_key: str | None = Form(None
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
 
-    results = [await _extract_one(file, api_key) for file in files]
+    results = [await _extract_one(file, api_key, provider) for file in files]
     return _xlsx_response(results)

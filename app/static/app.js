@@ -16,6 +16,7 @@ const billsContainer = document.getElementById("billsContainer");
 const downloadBtn = document.getElementById("downloadBtn");
 const settingsToggle = document.getElementById("settingsToggle");
 const settingsPanel = document.getElementById("settingsPanel");
+const providerSelect = document.getElementById("providerSelect");
 const apiKeyInput = document.getElementById("apiKeyInput");
 const saveKeyBtn = document.getElementById("saveKeyBtn");
 const toastContainer = document.getElementById("toastContainer");
@@ -23,18 +24,42 @@ const toastContainer = document.getElementById("toastContainer");
 // Holds the File objects the user has currently selected.
 let selectedFiles = [];
 
-// ---------- Settings (API key persisted in localStorage) ----------
+// ---------- Settings (persisted in localStorage) ----------
 
-apiKeyInput.value = localStorage.getItem("gemini_api_key") || "";
+apiKeyInput.value = localStorage.getItem("ocr_api_key") || "";
+providerSelect.value = localStorage.getItem("ocr_provider") || "auto";
 
 settingsToggle.addEventListener("click", () => {
   settingsPanel.classList.toggle("hidden");
 });
 
 saveKeyBtn.addEventListener("click", () => {
-  localStorage.setItem("gemini_api_key", apiKeyInput.value.trim());
-  showToast("API key saved", "success");
+  localStorage.setItem("ocr_api_key", apiKeyInput.value.trim());
+  localStorage.setItem("ocr_provider", providerSelect.value);
+  showToast("Settings saved", "success");
 });
+
+providerSelect.addEventListener("change", () => {
+  localStorage.setItem("ocr_provider", providerSelect.value);
+});
+
+// Fetch available providers from the server and mark unavailable ones.
+(async function loadProviders() {
+  try {
+    const res = await fetch("/api/bills/providers");
+    if (!res.ok) return;
+    const providers = await res.json();
+    // Update the dropdown options with availability hints.
+    providers.forEach((p) => {
+      const option = providerSelect.querySelector(`option[value="${p.id}"]`);
+      if (option && !p.available && p.id !== "auto" && p.id !== "tesseract") {
+        option.textContent += " (no server key)";
+      }
+    });
+  } catch {
+    // Non-critical — dropdown already has static options.
+  }
+})();
 
 // ---------- File selection (drag-and-drop + click-to-browse) ----------
 
@@ -136,14 +161,17 @@ let lastResults = null;
 async function extractBills() {
   if (selectedFiles.length === 0) return;
 
-  setLoading(true, "Reading your bill…");
+  const provider = providerSelect.value || "auto";
+  setLoading(true, `Reading your bill via ${providerLabel(provider)}…`);
   resultsSection.classList.add("hidden");
 
   try {
     const formData = new FormData();
     selectedFiles.forEach((file) => formData.append("files", file));
-    const apiKey = localStorage.getItem("gemini_api_key");
+
+    const apiKey = localStorage.getItem("ocr_api_key");
     if (apiKey) formData.append("api_key", apiKey);
+    formData.append("provider", provider);
 
     const response = await fetch("/api/bills/preview", {
       method: "POST",
@@ -164,6 +192,16 @@ async function extractBills() {
   } finally {
     setLoading(false);
   }
+}
+
+function providerLabel(id) {
+  const labels = {
+    auto: "Auto",
+    gemini: "Gemini",
+    groq: "Groq",
+    tesseract: "Tesseract",
+  };
+  return labels[id] || id;
 }
 
 async function safeErrorDetail(response) {

@@ -20,14 +20,27 @@
     <button id="settingsToggle" class="icon-btn" title="Settings">⚙️</button>
   </header>
 
-  <!-- Collapsible settings panel: holds the Gemini API key, saved to localStorage -->
+  <!-- Collapsible settings panel -->
   <section id="settingsPanel" class="settings-panel hidden">
-    <label for="apiKeyInput">Gemini API Key <span class="muted">(optional — leave blank to use Tesseract fallback)</span></label>
-    <div class="settings-row">
-      <input id="apiKeyInput" type="password" placeholder="Paste your Gemini API key" autocomplete="off" />
-      <button id="saveKeyBtn" class="btn btn-secondary">Save</button>
+    <div class="settings-group">
+      <label for="providerSelect">OCR Provider</label>
+      <select id="providerSelect" class="select-input">
+        <option value="auto">Auto (best available)</option>
+        <option value="gemini">Google Gemini</option>
+        <option value="groq">Groq (Llama Vision) — free tier</option>
+        <option value="tesseract">Tesseract (local, offline)</option>
+      </select>
+      <p class="hint">Auto will pick the first provider with a configured API key, falling back to Tesseract.</p>
     </div>
-    <p class="hint">Stored only in your browser's localStorage. Get a key at Google AI Studio.</p>
+
+    <div class="settings-group">
+      <label for="apiKeyInput">API Key <span class="muted">(optional — overrides server-side key)</span></label>
+      <div class="settings-row">
+        <input id="apiKeyInput" type="password" placeholder="Paste your Gemini or Groq API key" autocomplete="off" />
+        <button id="saveKeyBtn" class="btn btn-secondary">Save</button>
+      </div>
+      <p class="hint">Stored only in your browser's localStorage. The key is sent with each request to the selected provider.</p>
+    </div>
   </section>
 
   <main class="container">
