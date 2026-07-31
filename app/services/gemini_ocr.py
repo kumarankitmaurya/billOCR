@@ -5,7 +5,9 @@ Gemini reads the bill image and returns JSON that already matches our
 needed here (unlike the Tesseract fallback).
 """
 
+# pyrefly: ignore [missing-import]
 from google import genai
+# pyrefly: ignore [missing-import]
 from google.genai import types
 
 from app.config import settings

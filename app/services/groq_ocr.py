@@ -7,6 +7,7 @@ which can read bill images and return structured JSON.
 import base64
 import logging
 
+# pyrefly: ignore [missing-import]
 from groq import Groq
 
 from app.config import settings
