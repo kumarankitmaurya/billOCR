@@ -1,37 +1,45 @@
-"""Turns one or more ExtractionResult objects into a styled .xlsx workbook.
+"""Turns one supplier's ingested bills into the per-company book-ledger workbook.
 
-Each bill gets its own pair of sheets: "<n> Summary" and "<n> Items", so
-multiple bills processed in one request end up in a single downloadable
-file instead of one file per bill.
+Layout (matches the shop's existing book, per output-format.md):
+  workbook = supplier
+  sheet    = company
+  each bill is a stacked, dated block inside its company's sheet:
+
+      DJ-STI-36600   2025-08-17
+      JAI MATA DI SRT   pc    price   tax    margin   SP  <- label row, once per sheet
+      SAGAR             4     595     0      119      714
+      SWIGGY            4     595
+      (blank separator)
+      DJ-STI-36742   2025-10-02                        <- next bill appends below
+      DIWALI SPL        6     720
+
+Columns D (tax) and E (margin) are *amounts*, not the raw percentages the
+review screen captured (tax_pct, margin_pct) — computed here, independently,
+for the book's benefit:
+  D = rate * tax_pct / 100
+  E = (rate + D) * margin_pct / 100   (margin on the tax-inclusive price,
+                                        matching the review screen's chain)
+Column F (SP / final price) is `final_price` exactly as it came from the
+review screen — never recomputed from D/E here, since the frontend already
+lets it be hand-overridden independently of tax_pct/margin_pct (see
+app/models.py). Any of the three is left blank if its underlying field
+wasn't set — these are shop-internal pricing decisions never read off the
+bill itself.
 """
 
 import io
+import re
+from pathlib import Path
 
 from openpyxl import Workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.styles import Font
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
-from app.models import ExtractionResult
+from app import db
+from app.config import settings
 
-_HEADER_FILL = PatternFill(start_color="1F2937", end_color="1F2937", fill_type="solid")
-_HEADER_FONT = Font(color="FFFFFF", bold=True)
-_ALT_ROW_FILL = PatternFill(start_color="F3F4F6", end_color="F3F4F6", fill_type="solid")
-_THIN_BORDER = Border(*(Side(style="thin", color="D1D5DB"),) * 4)
-
-_ITEM_HEADERS = [
-    ("Serial No.", "serial_no"),
-    ("Item Name", "item_name"),
-    ("Description", "description"),
-    ("HSN/SAC", "hsn_sac_code"),
-    ("Quantity", "quantity"),
-    ("Unit", "unit"),
-    ("Rate", "rate"),
-    ("Discount", "discount"),
-    ("Tax Rate (%)", "tax_rate"),
-    ("Tax Amount", "tax_amount"),
-    ("Total", "total"),
-]
+_UNSAFE_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]')
 
 
 def _autofit(sheet: Worksheet) -> None:
@@ -41,58 +49,9 @@ def _autofit(sheet: Worksheet) -> None:
         sheet.column_dimensions[get_column_letter(col_cells[0].column)].width = max(10, length + 2)
 
 
-def _write_summary_sheet(sheet: Worksheet, result: ExtractionResult) -> None:
-    bill = result.bill
-    sheet.append(["Bill Summary", ""])
-    sheet["A1"].font = Font(size=14, bold=True)
-    sheet.merge_cells("A1:B1")
-
-    rows = [
-        ("Source File", result.source_filename),
-        ("Extraction Engine", result.engine),
-        ("Vendor Name", bill.vendor_name),
-        ("Vendor Address", bill.vendor_address),
-        ("Bill Number", bill.bill_number),
-        ("Bill Date", bill.bill_date),
-        ("Customer Name", bill.customer_name),
-        ("Subtotal", bill.subtotal),
-        ("Tax Total", bill.tax_total),
-        ("Grand Total", bill.grand_total),
-        ("Payment Method", bill.payment_method),
-    ]
-    for label, value in rows:
-        sheet.append([label, value])
-        row = sheet.max_row
-        sheet.cell(row=row, column=1).font = Font(bold=True)
-        sheet.cell(row=row, column=1).fill = _ALT_ROW_FILL
-
-    _autofit(sheet)
-
-
-def _write_items_sheet(sheet: Worksheet, result: ExtractionResult) -> None:
-    headers = [label for label, _ in _ITEM_HEADERS]
-    sheet.append(headers)
-    for cell in sheet[1]:
-        cell.font = _HEADER_FONT
-        cell.fill = _HEADER_FILL
-        cell.alignment = Alignment(horizontal="center")
-        cell.border = _THIN_BORDER
-
-    for index, item in enumerate(result.bill.line_items, start=1):
-        row = [getattr(item, field) for _, field in _ITEM_HEADERS]
-        sheet.append(row)
-        fill = _ALT_ROW_FILL if index % 2 == 0 else None
-        for cell in sheet[sheet.max_row]:
-            cell.border = _THIN_BORDER
-            if fill:
-                cell.fill = fill
-
-    _autofit(sheet)
-
-
-def _safe_sheet_title(base: str, suffix: str, used: set[str]) -> str:
+def _safe_sheet_title(name: str, used: set[str]) -> str:
     """Excel sheet titles must be <=31 chars and unique within the workbook."""
-    title = f"{base} {suffix}"[:31]
+    title = name[:31]
     original = title
     counter = 2
     while title in used:
@@ -102,20 +61,54 @@ def _safe_sheet_title(base: str, suffix: str, used: set[str]) -> str:
     return title
 
 
-def build_excel(results: list[ExtractionResult]) -> io.BytesIO:
-    """Build the workbook and return it as an in-memory buffer ready to stream."""
+def _write_company_sheet(
+    sheet: Worksheet,
+    company_name: str,
+    bills: list[tuple[str, str, list[tuple[str, int, float, float | None, float | None, float | None]]]],
+) -> None:
+    label_written = False
+    for bill_no, bill_date, lines in bills:
+        sheet.append([bill_no, bill_date])
+        sheet.cell(row=sheet.max_row, column=1).font = Font(bold=True)
+
+        if not label_written:
+            sheet.append([company_name, "pc", "price", "tax", "margin", "SP"])
+            sheet.cell(row=sheet.max_row, column=1).font = Font(italic=True)
+            label_written = True
+
+        for product, pcs, rate, final_price, margin_pct, tax_pct in lines:
+            tax_amount = round(rate * tax_pct / 100, 2) if tax_pct is not None else None
+            margin_amount = round((rate + (tax_amount or 0)) * margin_pct / 100, 2) if margin_pct is not None else None
+            sheet.append([product, pcs, rate, tax_amount, margin_amount, final_price])
+
+        sheet.append([])  # blank separator between bills
+
+    _autofit(sheet)
+
+
+def _output_path(supplier_name: str) -> Path:
+    """Where this supplier's workbook is saved on disk (see settings.output_dir)."""
+    safe_name = _UNSAFE_FILENAME_CHARS.sub("_", supplier_name).strip() or "supplier"
+    return Path(settings.output_dir) / f"{safe_name}.xlsx"
+
+
+def build_supplier_workbook(supplier_name: str) -> io.BytesIO:
+    """Build the supplier's full book from the DB, save it under
+    settings.output_dir, and return it as an in-memory buffer.
+
+    Raises KeyError if the supplier has no ingested bills.
+    """
+    data = db.get_workbook_data(supplier_name)
+
     workbook = Workbook()
-    # Drop the default blank sheet openpyxl creates.
     workbook.remove(workbook.active)
 
     used_titles: set[str] = set()
-    for index, result in enumerate(results, start=1):
-        base_name = f"Bill {index}"
-        summary_sheet = workbook.create_sheet(_safe_sheet_title(base_name, "Summary", used_titles))
-        _write_summary_sheet(summary_sheet, result)
+    for company_name, bills in data.items():
+        sheet = workbook.create_sheet(_safe_sheet_title(company_name, used_titles))
+        _write_company_sheet(sheet, company_name, bills)
 
-        items_sheet = workbook.create_sheet(_safe_sheet_title(base_name, "Items", used_titles))
-        _write_items_sheet(items_sheet, result)
+    workbook.save(_output_path(supplier_name))
 
     buffer = io.BytesIO()
     workbook.save(buffer)

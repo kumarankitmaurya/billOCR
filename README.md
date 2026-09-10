@@ -1,8 +1,15 @@
 # Bill OCR → Excel Service
 
-Upload photos of bills/invoices, get back a clean, structured Excel file.
-It uses **Google Gemini Vision** to read the bill, and falls back to local
-**Tesseract OCR** if no Gemini API key is configured.
+API-only backend for turning photos of textile trade bills into a
+per-supplier Excel book matching the shop's existing ledger (one sheet per
+company/mill, each bill a dated block of product/pcs/rate rows). Uses
+**Google Gemini** or **Groq** (Qwen Vision) to read the bill; ingested bills
+persist in a local SQLite file so the workbook can always be rebuilt or
+re-downloaded later.
+
+The frontend is a separate React app — **billOCR-ui** — in a sibling repo.
+This service has no UI of its own; see `FRONTEND.md` for the API contract it
+implements.
 
 ---
 
@@ -45,42 +52,34 @@ Your terminal prompt should now start with `(venv)`. You'll need to run this act
 pip install -r requirements.txt
 ```
 
-This reads `requirements.txt` and installs FastAPI, the Gemini SDK, Tesseract's Python wrapper, Excel generation library, etc.
+This reads `requirements.txt` and installs FastAPI, the Gemini and Groq SDKs, the Excel generation library, etc.
 
-### 5. (Optional but recommended) Install Tesseract OCR
-
-This is a separate program (not a Python package) used as a fallback when no Gemini API key is set:
-
-```bash
-brew install tesseract     # macOS
-# or
-sudo apt install tesseract-ocr   # Ubuntu/Debian
-```
-
-### 6. Set up your Gemini API key
+### 5. Set up your Gemini or Groq API key
 
 Get a free key from [Google AI Studio](https://aistudio.google.com/apikey). You have two options:
 
-- **Easiest**: skip this step and paste your key directly into the web app's settings panel (⚙️ icon) when it's running — it's saved in your browser.
+- **Easiest**: skip this step and paste your key directly into the frontend's settings panel when it's running — it's saved in your browser and sent per-request, never stored server-side.
 - **Or**, create a `.env` file so the server always has it:
   ```bash
   cp .env.example .env
   ```
   Then open `.env` and replace `your_api_key_here` with your real key.
 
-### 7. Run the server
+### 6. Run the server
 
 ```bash
 uvicorn app.main:app --reload --port 8000
 ```
 
-You should see output like `Uvicorn running on http://127.0.0.1:8000`. Keep this terminal window open — closing it stops the server.
+You should see output like `Uvicorn running on http://127.0.0.1:8000`. Keep this terminal window open — closing it stops the server. A `bills.db` SQLite file is created next to the project on first run.
 
-### 8. Open the app
+### 7. Run the frontend
 
-Go to **http://localhost:8000** in your browser. Drag a bill photo in, click "Extract Data" to preview it, then "Download Excel" to get your spreadsheet.
+This backend has no browsable UI of its own — clone and run **billOCR-ui**
+(the sibling frontend repo) separately, pointed at `http://localhost:8000`.
+See that repo's README for its own setup steps.
 
-To stop the server, press `Ctrl+C` in the terminal.
+To stop this server, press `Ctrl+C` in the terminal.
 
 ---
 
@@ -88,46 +87,49 @@ To stop the server, press `Ctrl+C` in the terminal.
 
 ```mermaid
 graph LR
-    A["Web UI"] -->|Upload Images| B["FastAPI Backend"]
-    B -->|Primary| C["Google Gemini Vision API"]
-    B -->|Fallback| D["Tesseract OCR + Regex"]
-    C -->|Structured JSON| E["Excel Generator"]
-    D -->|Structured JSON| E
+    A["billOCR-ui (React, sibling repo)"] -->|Upload images + supplier| B["FastAPI Backend"]
+    B -->|Vision extraction| C["Gemini / Groq"]
+    C -->|"{supplier, bill_no, bill_date, articles[]}"| D["SQLite book of record"]
+    D -->|Per-company sheets| E["Excel Generator"]
     E -->|.xlsx Download| A
 ```
 
-1. You upload one or more bill images through the browser.
-2. The backend sends each image to Gemini with a request for structured JSON matching our `BillData` schema.
-3. If Gemini fails (no key, network error, etc.), the backend runs the image through Tesseract OCR instead and parses the raw text with regex heuristics.
-4. The structured data is either shown as a preview table or turned into a styled `.xlsx` workbook (one summary + line-items sheet pair per bill) for download.
+1. You upload one or more bill images through billOCR-ui, optionally naming the supplier up front (see `HANDOVER.md`: supplier is chosen by the user, not read off the image, when given).
+2. The backend sends each image to Gemini or Groq, asking it to split the bill's DESCRIPTION column into `company` (mill/brand) and `product` (design name), and return `{supplier, bill_no, bill_date, articles: [{company, product, pcs, rate}]}` — see `output-format.md` for the full contract.
+3. Extracted bills are shown as a preview table before anything is saved.
+4. On download, each bill is ingested into a local SQLite database keyed by `(supplier, bill_no)` — re-ingesting the same bill replaces its lines rather than duplicating them — and the supplier's full workbook is rebuilt from the database: one sheet per company, each bill a dated block of `product | pcs | rate` rows, plus two optional per-line pricing fields set during review (`final_price`, `margin_pct`) that fill in columns E/F when present — see `ARCHITECTURE.md` for the schema and `output-format.md` for the column mapping.
 
 ## API
 
-- `POST /api/bills/preview` — multipart form (`files`, optional `api_key`) → JSON array of extracted bills.
-- `POST /api/bills/workbook` — JSON body: the array returned by `/preview` → streams a `.xlsx` file. Runs no OCR.
-- `POST /api/bills/extract` — multipart form, same as `/preview` → streams a `.xlsx` file directly. One-shot convenience path for scripts.
+- `GET /api/bills/providers` — which OCR providers are configured, for the UI dropdown.
+- `POST /api/bills/preview` — multipart form (`files`, optional `supplier`, `api_key`, `provider`) → JSON array of extracted bills. Runs no persistence.
+- `POST /api/bills/ingest` — JSON body `{results, supplier}` (`results` from `/preview`) → persists into the book of record, returns `{ingested, suppliers}`.
+- `GET /api/bills/workbook?supplier=NAME` → streams that supplier's full `.xlsx`, rebuilt from the database.
+- `POST /api/bills/extract` — multipart form, same as `/preview` plus ingestion → streams the resulting workbook directly. One-shot convenience path for scripts; requires the batch to resolve to exactly one supplier.
 
-The web UI uses `/preview` then `/workbook`, so previewing and downloading costs a single extraction rather than two.
+billOCR-ui uses `/preview` then `/ingest` + `/workbook`, so previewing costs a single extraction and the workbook always reflects everything ever ingested for that supplier, not just the current upload.
 
 ## Design notes
 
-See **[ARCHITECTURE.md](ARCHITECTURE.md)** for the strategies behind the implementation — the fallback design, why the Pydantic schema doubles as the Gemini prompt, the OCR preprocessing choices — plus known trade-offs and open issues.
+`ARCHITECTURE.md` documents the current system (DB schema, ingest/idempotency, OCR fallback, the price/margin fields). `implementation_plan.md` describes the original generic-invoice version of this tool and predates the textile-specific schema in `HANDOVER.md`/`output-format.md`/`workflow.md` — treat that one as historical, not current.
 
 ## Project structure
 
 ```
 billOCR/
 ├── app/
-│   ├── main.py               # FastAPI app, CORS, static mount
+│   ├── main.py               # FastAPI app, CORS, DB init (API-only, no UI)
 │   ├── config.py             # Settings (env vars, .env)
-│   ├── models.py             # Pydantic schemas
+│   ├── models.py             # Pydantic schemas (BillExtraction, Article)
+│   ├── db.py                 # SQLite book of record (supplier/company/bill/line)
 │   ├── routers/bills.py      # API endpoints
-│   ├── services/
-│   │   ├── gemini_ocr.py     # Gemini Vision extraction
-│   │   ├── tesseract_ocr.py  # Tesseract fallback extraction
-│   │   └── excel_export.py   # openpyxl Excel generation
-│   └── static/                # Frontend (HTML/CSS/JS)
+│   └── services/
+│       ├── gemini_ocr.py     # Gemini Vision extraction
+│       ├── groq_ocr.py       # Groq Qwen Vision extraction
+│       └── excel_export.py   # openpyxl per-company book-ledger export
 ├── uploads/
 ├── requirements.txt
 └── .env.example
 ```
+
+The frontend (billOCR-ui) lives in its own repo, not here.

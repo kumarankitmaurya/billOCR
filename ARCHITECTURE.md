@@ -1,180 +1,207 @@
-# Design Strategies
+# Architecture
 
-A catalogue of the deliberate techniques used in this codebase, why each was chosen, and what it costs. Written for someone modifying the code who needs to know which decisions are load-bearing.
+A catalogue of the deliberate techniques used in this codebase, why each was
+chosen, and what it costs. Written for someone modifying the code who needs
+to know which decisions are load-bearing. Companion docs: `HANDOVER.md`
+(domain model, decisions log), `output-format.md` (exact field/column
+contract), `FRONTEND.md` (the API contract billOCR-ui depends on).
 
 ---
 
-## 1. Two-tier extraction with graceful degradation
-
-**Where:** `app/routers/bills.py:16-28`
-
-Gemini is tried first; *any* exception falls through to Tesseract. The engine that actually ran is recorded on the result (`ExtractionResult.engine`) and surfaced in both the UI badge and the Excel summary sheet.
+## 1. Two repos, one contract
 
 ```
-Gemini (accurate, needs key + network)  ──fail──▶  Tesseract (local, always available)
+┌── billOCR-ui (sibling repo) ─────┐        ┌── billOCR (this repo) ───────────────┐
+│ React + TS + Vite + Tailwind     │  HTTP  │  FastAPI, API-only (no served UI)    │
+│ Capture → Review → Done          │ ─────► │  /api/bills/{preview,ingest,workbook}│
+│ Zustand store, MSW mocks+tests   │ ◄───── │  SQLite book of record               │
+└───────────────────────────────────┘  CORS *│  OCR (Gemini/Groq) → Excel export    │
+                                              └────────────────────────────────────┘
 ```
 
-**Why:** the service stays useful with no API key, no network, or an expired quota. A user who never opens the settings panel still gets output.
+**Where:** `app/main.py` (no static mount — this backend has no UI of its
+own); `billOCR-ui/src/api/{types.ts,client.ts}`.
 
-**Cost:** the `except Exception` is deliberately broad, so a genuine bug inside `gemini_ocr.py` degrades silently to worse output instead of surfacing. The `logger.warning` is the only signal. If you are debugging "why is it always using Tesseract", read the logs first — that warning line carries the real cause.
+**Why:** the two repos are versioned and deployed independently, but share
+one contract by convention, not by code generation — `app/models.py`
+(Pydantic) and `billOCR-ui/src/api/types.ts` (TypeScript) are hand-kept in
+lockstep. `FRONTEND.md` §3 is the narrative version of that contract; when
+either side's shape changes, both files and that doc need updating together.
 
----
-
-## 2. The Pydantic schema *is* the prompt
-
-**Where:** `app/models.py`, consumed at `app/services/gemini_ocr.py:45`
-
-`BillData` serves three roles simultaneously: Gemini's `response_schema`, the API response type, and the Excel exporter's input. The `Field(description=...)` strings are not documentation — they are extraction instructions the model reads.
-
-**Why:** one definition, no drift. Editing a field description changes extraction behaviour, the OpenAPI docs, and the response contract in a single edit. It also removes text parsing from the primary path entirely: Gemini returns conforming JSON rather than prose to be regexed.
-
-**Implication:** if you add a field, write the `description` as an instruction to the model ("HSN or SAC code, if present"), not as a note to a developer.
-
-The response is re-validated with `model_validate_json` (`gemini_ocr.py:51`) even though the SDK already enforces the schema — cheap insurance that yields a real typed object rather than trusting the transport.
+**Cost:** no compiler catches drift between the two type definitions. A
+field renamed in `Article` silently breaks billOCR-ui only at runtime (a
+`KeyError`-shaped bug, or a field that's always `undefined`), not at build
+time. Grep both repos for the field name before renaming anything in
+`app/models.py`.
 
 ---
 
-## 3. Nullable-by-default, never guess
+## 2. The book of record: SQLite, not the Excel file
 
-**Where:** `app/models.py:29-45`, prompt rule at `app/services/gemini_ocr.py:20`
+**Where:** `app/db.py`
 
-Every field except `line_items` is optional, and the prompt explicitly says *"If a field is not present on the bill, leave it null — do not guess."*
-
-**Why:** bill layouts vary enormously — a market receipt has no HSN code, a service invoice has no unit. A schema demanding those fields forces the model to hallucinate. For financial data, a blank cell is honest and a fabricated number is a liability.
-
-Only `item_name`, `quantity`, `rate`, `total` are required, and only on `LineItem` — the minimum for a row to mean anything.
-
----
-
-## 4. Binarisation before OCR
-
-**Where:** `app/services/tesseract_ocr.py:41-48`
-
-Grayscale → autocontrast → hard threshold at 150.
-
-**Why:** Tesseract is markedly more accurate on high-contrast bitonal input than on a photo with shadows and uneven lighting. Autocontrast first normalises exposure so the fixed 150 cutoff behaves consistently across differently-lit photos.
-
-**Cost:** 150 is a magic constant tuned for typical printed receipts. Very faint thermal-printer output or dark photographs may wash out entirely. This is the first knob to turn if the fallback returns empty text.
-
----
-
-## 5. Vocabulary-tolerant regex, positional line items
-
-**Where:** `app/services/tesseract_ocr.py:19-33`
-
-Summary fields use synonym alternation and tolerant punctuation:
-
-```python
-r"(?:grand\s*total|total\s*amount|net\s*amount)\s*[:\-]?\s*₹?\$?\s*([\d,]+\.?\d*)"
+```
+supplier ──< company ──< line >── bill
+(id, name)   (id, supplier_id,   (id, bill_id, company_id, product,
+              name)                pcs, rate, line_order,
+                                    final_price, margin_pct)
+                          bill (id, supplier_id, bill_no, bill_date, entered_at)
 ```
 
-Optional currency symbols, optional separators, flexible whitespace — because OCR output spacing is unreliable and vendors phrase labels differently.
+- `supplier` and `company` are `get_or_create`d by exact-string name — there
+  is no canonical ID a client can pass, no fuzzy matching, no merge tool.
+  Two spellings of the same real-world supplier ("Dindayal Jalan" vs.
+  "Dindayal Jalan Textiles Pvt.Ltd") are two different rows, fragmenting the
+  book, with no automatic reconciliation. This has already happened in
+  practice — the fix today is manual (delete/rename one supplier's rows).
+- `bill` is `UNIQUE(supplier_id, bill_no)` — this is the idempotency key.
+  `line` rows aren't unique on anything; a re-ingest deletes every `line`
+  under the bill and reinserts from the incoming payload (`_upsert_bill` in
+  `app/db.py`), so editing-then-resaving a bill is a full replace, not a
+  diff.
+- `final_price`/`margin_pct` (added for the review screen's price/margin
+  fields — see §5) are nullable `REAL` columns with **no `CREATE TABLE IF
+  NOT EXISTS` safety net** for existing databases: SQLite's `IF NOT EXISTS`
+  only guards table creation, not new columns on a table that already
+  exists. `init_db()` runs an explicit `PRAGMA table_info` check and `ALTER
+  TABLE ... ADD COLUMN` for anything missing, every startup. **This is the
+  pattern to follow for any future column added to an existing table** —
+  don't assume `_SCHEMA`'s `CREATE TABLE IF NOT EXISTS` retrofits a live DB.
 
-Line items instead match by *position*: `name → qty → rate → total`, anchored with `^`/`$` so partial matches don't produce garbage rows.
+**Why SQLite as the source of truth, not the `.xlsx`:** the shop's shape
+(per-company sheets, dated blocks) and a query-friendly relational shape
+don't coincide — deriving the book view from a relational store is far
+simpler than parsing it back out of a spreadsheet. `excel_export.py` is a
+pure read: `build_supplier_workbook()` never writes to the DB.
 
-**Why positional:** a raw text dump has lost the table structure. Column order is the only surviving signal.
-
-**Cost:** this is the weakest part of the fallback and it is expected to be. Multi-line item names, wrapped descriptions, and columns in a different order all fail to match — and a non-matching line is skipped silently, so items go missing rather than arriving wrong. Two mitigations are in place: `_to_float` strips thousands separators (`:35-38`), and a missing total is derived as `qty × rate` (`:70`).
+**Cost:** the on-disk `.xlsx` files under `OUTPUT_DIR` are a cache, not a
+record — if the shop hand-edits a downloaded workbook, that edit is invisible
+to the system and gets silently clobbered the next time anyone re-downloads
+that supplier's book. There is no import path from Excel back into SQLite.
 
 ---
 
-## 6. Caller-supplied key beats server config
+## 3. OCR provider strategy: try, fall through, never guess
 
-**Where:** `app/services/gemini_ocr.py:31` — `key = api_key or settings.gemini_api_key`
+**Where:** `app/services/ocr_strategy.py`
 
-Precedence: per-request form field → environment/`.env`.
+```
+provider="auto" ──► try_order from configured API keys ──► gemini ──fail──► groq ──fail──► raise last_error
+```
 
-**Why:** supports both deployment shapes from one code path. A self-hoster sets `GEMINI_API_KEY` once and users never see a key prompt; a shared deployment ships no key and each user brings their own via the settings panel.
+Each provider is attempted in order (`gemini_ocr.py`, `groq_ocr.py`); any
+exception moves to the next. The engine that actually ran is recorded on the
+result (`ExtractionResult.engine`) and surfaced to the caller. If every
+provider fails, the last exception propagates — `app/routers/bills.py`'s
+`_extract_one` catches it there and turns it into a clean `502` with the
+real reason in `detail`, rather than letting it reach FastAPI's default
+handler as an unhandled 500 with a plain-text body (a real bug fixed this
+way — see git history on `bills.py`).
 
-**Security posture:** the browser key lives in `localStorage` and is transmitted per request; it is never written to server-side storage or logs. On a shared deployment, note this still means users are sending their key to your server — it is trusted with the key for the duration of the request. Deploy over TLS.
+**Why:** the service stays useful with whichever key is configured, and a
+transient failure on one provider doesn't fail the whole request.
+
+**Nullable-by-default, never guess** (`app/models.py`): `bill_no`/`bill_date`
+are `str | None`, and both prompts (`gemini_ocr.py`, `groq_ocr.py`)
+explicitly instruct "if not legible, return null — do NOT guess." The same
+pattern now applies to `final_price`/`margin_pct` (§5): the prompts
+explicitly say these are *never* on the bill and must always come back
+`null`, because a model given an `Optional[float]` field with no other
+instruction may still try to be helpful and compute something.
+
+**Cost:** the response schema (`BillExtraction`/`Article`) doubles as
+Gemini's `response_schema` *and* Groq's hand-written JSON-schema prompt text
+*and* the `/ingest` request body shape. Add a field to `Article` and there
+are three places that need the addition to stay in sync: the Pydantic model,
+Groq's literal schema block in its prompt string, and (if the field must
+never be OCR'd) an explicit "always null" instruction in both prompts —
+Pydantic's `response_schema` alone does not stop Gemini from populating an
+optional field with a plausible-looking guess.
 
 ---
 
-## 7. In-memory buffers, no temp files
-
-**Where:** `app/services/excel_export.py:105-125`, `app/routers/bills.py:18,51`
-
-Uploads are read straight to `bytes`; the workbook is built into a `BytesIO` and handed to `StreamingResponse`. Nothing touches disk.
-
-**Why:** no cleanup logic, no orphaned files, no leaking one user's bill into another's directory, and the service works on a read-only filesystem.
-
-> **Dead config:** `settings.upload_dir` and the `os.makedirs` at `app/config.py:21,30` are vestigial — the directory is created at import but nothing ever writes to it. The original plan called for temp storage; the implementation went in-memory instead. Safe to delete both, along with the `uploads/` folder.
-
----
-
-## 8. Excel structure and defensive sheet naming
+## 4. Excel export: a generated view, one write path
 
 **Where:** `app/services/excel_export.py`
 
-One workbook, two sheets per bill (`Bill N Summary`, `Bill N Items`) so a multi-file upload yields a single download rather than a zip.
-
-`_safe_sheet_title` (`:93-103`) enforces Excel's two hard constraints — titles ≤31 characters and unique within a workbook — by truncating, then suffixing `-2`, `-3` on collision. **These are format-level rules, not style choices:** violating either makes openpyxl raise or produces a file Excel refuses to open. Keep this function in the path if you change naming.
-
-`_autofit` (`:37-41`) approximates column width from the longest cell value, with a floor of 10, since openpyxl has no true auto-fit.
-
----
-
-## 9. Extract once, export from the result
-
-**Where:** `app/routers/bills.py:41-53`, driven by `app/static/app.js:264-275`
-
-The UI's two-step flow deliberately splits extraction from export:
-
 ```
-/preview   images ──▶ JSON     (OCR runs here, once)
-/workbook  JSON   ──▶ .xlsx    (no OCR — pure formatting)
+GET /api/bills/workbook?supplier=X
+  ├─► db.get_workbook_data(X)         # read-only: {company: [(bill_no, bill_date, [lines])]}
+  ├─► build one sheet per company     # _write_company_sheet, dated blocks
+  ├─► save to OUTPUT_DIR/X.xlsx       # side effect: a cache, not the record (§2)
+  └─► stream the same bytes back      # the actual HTTP response
 ```
 
-The download button posts back the `ExtractionResult` JSON the client already received rather than re-uploading the images. `build_excel` consumes exactly the shape `/preview` emits, so no translation layer is needed.
+`build_supplier_workbook()` does the on-disk save and returns the in-memory
+buffer in the same call — both come from one `Workbook` object, so the
+downloaded file and the on-disk cache can never diverge from each other
+(they can still diverge from the DB, per §2, if hand-edited afterward).
 
-**Why:** the obvious implementation — download re-posts the files to `/extract` — silently doubles the work. On the Gemini path that is a **second billed API call and a second multi-second wait for data the browser is already holding.** Verified via the fallback log line, which fires once per extraction: a preview-then-download cycle now logs one, not two.
+**Why one function does both:** simplicity — a supplier's workbook is cheap
+enough to regenerate in full on every request rather than diffed/patched, so
+there's no incremental-write path to keep correct.
 
-`/extract` (`:56-66`) is retained as a one-shot `images → .xlsx` path for API clients and `curl` that don't want a preview round-trip. Both routes funnel through `_xlsx_response`, and their output is byte-identical for the same input.
-
-**Consequence — staleness must be handled.** Because the export now ships precisely what's on screen, an edited file selection would otherwise let a user download a table that doesn't match their files. `invalidateResults()` (`app.js:76-84`) drops `lastResults` and the rendered table together on every mutation of the selection, so the two can never diverge.
-
----
-
-## 10. Route order: API before static mount
-
-**Where:** `app/main.py:29-33` — `include_router` precedes `app.mount("/static", ...)`
-
-FastAPI matches routes in registration order. The API router is registered first so a static mount can never shadow an endpoint. `/` is a separate explicit `FileResponse` handler (`:36-39`) rather than a `StaticFiles(html=True)` mount at root, which would have swallowed unmatched API paths and returned HTML where JSON was expected.
-
----
-
-## 11. Frontend: escape at the boundary
-
-**Where:** `app/static/app.js:252-256`
-
-```js
-function escapeHtml(value) {
-  const div = document.createElement("div");
-  div.textContent = value ?? "";
-  return div.innerHTML;
-}
-```
-
-Every OCR-derived string is passed through this before reaching `innerHTML` (`:195,208,230,232`). **This matters more than it looks:** the text originates from an uploaded image via an LLM, so it is fully attacker-controlled — a crafted bill image can carry markup. The DOM round-trip delegates escaping to the browser rather than a hand-rolled replace chain.
-
-Object URLs are revoked after use (`:102,288`) so repeated uploads don't leak blobs.
+**Column layout** (`_write_company_sheet`): A/B/C = product/pcs/rate always;
+D = loading, still reserved and always blank (not captured anywhere yet); E
+= margin *amount* = `rate * margin_pct / 100` when `margin_pct` was set on
+that line, else blank; F = `final_price` exactly as entered, else blank. The
+label row (`pc | price | . | margin | SP`) is written once per company
+sheet, not once per bill block.
 
 ---
 
-## Known trade-offs and open issues
+## 5. Price/margin fields: shop-only, never OCR'd, computed at the edge
 
-These are real, currently in the code, and worth fixing before production use.
+**Where:** `app/models.py` (`Article.final_price`, `Article.margin_pct`),
+`app/db.py` (`line.final_price`, `line.margin_pct`), `excel_export.py` (§4).
 
-### Blocking calls inside async handlers
+These two fields exist for exactly one reason: the shop's selling price and
+margin are business decisions made by a person, never printed on a
+supplier's bill (same category as the pre-existing SP concept in
+`HANDOVER.md` §3 — "SP stays manual... the scan must not clobber it"). The
+design consequence is that they:
 
-`gemini_ocr.extract_bill_data` (network I/O) and `tesseract_ocr.extract_bill_data` (CPU-bound subprocess) are synchronous, called directly from `async def` handlers (`bills.py:21,27`). Each blocks the event loop for its full duration — seconds — during which the server serves no other request.
+- are **not** derived from `rate` anywhere upstream of the Excel export —
+  the backend stores exactly what the review screen sends, no clamping, no
+  sanity-checking against `rate`;
+- are **not** part of what the OCR prompt asks for — they're declared on
+  the shared `Article` schema (so `/ingest` can accept them) but the prompts
+  explicitly instruct both providers to always return `null` for them (§3);
+- are stored raw (`margin_pct` as a percent, not pre-multiplied) so that a
+  later `rate` correction on the review screen doesn't leave a stale
+  computed value sitting in the DB — the multiplication happens once, at
+  export time, from whatever `rate`/`margin_pct` currently are.
 
-Fix: `await run_in_threadpool(...)` from `starlette.concurrency`, or declare the handlers `def` instead of `async def` and let FastAPI move them to its threadpool automatically.
+**Cost / open question:** because `margin_pct` is normalized (stored as a
+percent, multiplied at export) but `final_price` is stored raw (whatever the
+user typed, no relationship to `rate`/`margin_pct` enforced), the two fields
+can disagree — someone can set `margin_pct=20` on a ₹100 line (→ ₹20 margin)
+and also type `final_price=999` with no connection between them. Nothing in
+this system reconciles that; if that's ever undesirable, decide in
+`FRONTEND.md`/`HANDOVER.md` whether `final_price` should become computed
+(`rate + margin_amount`) or stay an independent override, and update both
+the UI and this doc together.
 
-### Multi-file uploads process sequentially
+---
 
-`[await _extract_one(file, api_key) for file in files]` (`bills.py:38,48`) awaits each file in turn, so ten bills take ten times one bill. These are independent and network-bound — `asyncio.gather` (once the blocking issue above is resolved) would make total latency roughly that of the slowest file.
+## 6. Idempotent ingest, not append-only
 
-### No upload limits
+**Where:** `app/db.py` `_upsert_bill` / `ingest_bill`
 
-Neither endpoint caps file size, file count, or validates that content is really an image. A large or malformed upload is read fully into memory. Add a size guard and a content-type allowlist before exposing this publicly.
+Re-POSTing the same `(supplier, bill_no)` to `/ingest` — whether because the
+same photo was scanned twice, or because the review screen's edits are being
+resaved — deletes every existing `line` row under that bill and reinserts
+from the current payload. There is no `line`-level diffing and no history:
+the previous version of a re-ingested bill's lines is gone, not archived.
+
+**Why:** the "scan the same bill twice by accident" case has to be free —
+that's the whole point of keying on `(supplier, bill_no)`. Diffing/archiving
+would need a design for what "history" even means when the *same physical
+bill* gets edited during review before the first save (is that a
+correction, or a new version?) — deliberately punted for now, same as the
+"price history" note in `output-format.md` (a re-priced product just shows
+up as a new dated block, not a version chain).
+
+**Cost:** there is no audit trail. If a review-screen edit is wrong and
+already saved, the only recovery is re-scanning and re-saving correctly —
+the previous (wrong) `line` rows are unrecoverable once overwritten.

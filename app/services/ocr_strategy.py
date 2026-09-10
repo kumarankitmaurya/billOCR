@@ -3,7 +3,7 @@
 Provider priority:
 1. If the caller explicitly picks a provider (via the UI dropdown), use that.
 2. Otherwise, auto-select based on which API keys are configured:
-   Gemini → Groq → Tesseract (local, no key needed).
+   Gemini → Groq.
 
 Each provider is attempted in order; if one fails, the next is tried
 automatically so the user always gets a result.
@@ -13,13 +13,13 @@ import logging
 from typing import Literal
 
 from app.config import settings
-from app.models import BillData, ExtractionResult
-from app.services import gemini_ocr, groq_ocr, tesseract_ocr
+from app.models import BillExtraction, ExtractionResult
+from app.services import gemini_ocr, groq_ocr
 
 logger = logging.getLogger(__name__)
 
 # The set of providers the user can pick from.
-Provider = Literal["auto", "gemini", "groq", "tesseract"]
+Provider = Literal["auto", "gemini", "groq"]
 
 # Maps provider names to (extract_fn, needs_api_key_field).
 _PROVIDERS = {
@@ -64,21 +64,20 @@ def extract(
     filename: str,
     provider: Provider = "auto",
     api_key: str | None = None,
+    supplier: str | None = None,
 ) -> ExtractionResult:
     """Run bill extraction using the selected (or auto-detected) provider.
 
-    Falls back through providers on failure, ending with Tesseract as the
-    last resort (local, no API key needed).
+    Tries each candidate provider in order and raises the last error if all
+    of them fail.
     """
-    if provider == "tesseract":
-        bill = tesseract_ocr.extract_bill_data(image_bytes)
-        return ExtractionResult(source_filename=filename, engine="tesseract", bill=bill)
-
-    # Build the ordered list of providers to attempt.
     if provider == "auto":
         try_order = _auto_order(api_key)
     else:
         try_order = [provider]
+
+    if not try_order:
+        raise ValueError("No OCR provider available: configure GEMINI_API_KEY or GROQ_API_KEY")
 
     last_error: Exception | None = None
 
@@ -86,21 +85,27 @@ def extract(
         info = _PROVIDERS[name]
         try:
             logger.info("Trying provider: %s", name)
-            bill = info["extract"](image_bytes, mime_type, api_key)
-            return ExtractionResult(source_filename=filename, engine=info["label"], bill=bill)
+            bill = info["extract"](image_bytes, mime_type, supplier, api_key)
+            return ExtractionResult(
+                source_filename=filename, engine=info["label"], bill=bill, flags=_quality_flags(bill)
+            )
         except Exception as exc:
             logger.warning("%s extraction failed for %s: %s", name, filename, exc)
             last_error = exc
 
-    # All cloud providers failed (or none were configured) — Tesseract fallback.
-    logger.info("Falling back to Tesseract for %s", filename)
-    try:
-        bill = tesseract_ocr.extract_bill_data(image_bytes)
-        return ExtractionResult(source_filename=filename, engine="tesseract", bill=bill)
-    except Exception as exc:
-        logger.error("Tesseract also failed for %s: %s", filename, exc)
-        # Re-raise the most meaningful error (cloud provider's) if available.
-        raise last_error or exc
+    raise last_error
+
+
+def _quality_flags(bill: BillExtraction) -> list[str]:
+    """Flag fields the model couldn't confidently read instead of letting a
+    fabricated value pass through silently (see HANDOVER.md §4: never
+    silently accept a mismatch/guess)."""
+    flags: list[str] = []
+    if not bill.bill_no:
+        flags.append("bill_no not detected — enter it manually before saving")
+    if not bill.bill_date:
+        flags.append("bill_date not detected — enter it manually before saving")
+    return flags
 
 
 def available_providers() -> list[dict]:
@@ -117,13 +122,8 @@ def available_providers() -> list[dict]:
     })
     providers.append({
         "id": "groq",
-        "name": "Groq (Llama Vision)",
+        "name": "Groq (Qwen Vision)",
         "available": bool(settings.groq_api_key),
-    })
-    providers.append({
-        "id": "tesseract",
-        "name": "Tesseract (local, offline)",
-        "available": True,
     })
 
     return providers
