@@ -65,6 +65,18 @@ Get a free key from [Google AI Studio](https://aistudio.google.com/apikey). You 
   ```
   Then open `.env` and replace `your_api_key_here` with your real key.
 
+### 5b. (Optional) Set an admin password for confidential search results
+
+`GET /api/bills/search` never reveals base price (`rate`) — the shop's actual
+cost — unless the request carries a matching `X-Admin-Password` header. This
+is off by default. To turn it on, add a line to your `.env`:
+
+```bash
+ADMIN_PASSWORD=pick-something-only-you-know
+```
+
+Leave it unset (or absent) to keep admin search disabled entirely.
+
 ### 6. Run the server
 
 ```bash
@@ -97,7 +109,8 @@ graph LR
 1. You upload one or more bill images through billOCR-ui, optionally naming the supplier up front (see `HANDOVER.md`: supplier is chosen by the user, not read off the image, when given).
 2. The backend sends each image to Gemini or Groq, asking it to split the bill's DESCRIPTION column into `company` (mill/brand) and `product` (design name), and return `{supplier, bill_no, bill_date, articles: [{company, product, pcs, rate}]}` — see `output-format.md` for the full contract.
 3. Extracted bills are shown as a preview table before anything is saved.
-4. On download, each bill is ingested into a local SQLite database keyed by `(supplier, bill_no)` — re-ingesting the same bill replaces its lines rather than duplicating them — and the supplier's full workbook is rebuilt from the database: one sheet per company, each bill a dated block of `product | pcs | rate` rows, plus two optional per-line pricing fields set during review (`final_price`, `margin_pct`) that fill in columns E/F when present — see `ARCHITECTURE.md` for the schema and `output-format.md` for the column mapping.
+4. On download, each bill is ingested into a local SQLite database keyed by `(supplier, bill_no)` — re-ingesting the same bill replaces its lines rather than duplicating them — and the supplier's full workbook is rebuilt from the database: one sheet per company, each bill a dated block of `product | pcs | rate` rows, plus three optional per-line pricing fields set during review (`tax_pct`, `margin_pct`, `final_price`) that fill in columns D/E/F when present — see `ARCHITECTURE.md` for the schema and `output-format.md` for the column mapping.
+5. Any ingested line can later be found again with `GET /api/bills/search` — by product name and/or price, across every supplier. Base price (`rate`) is confidential: it's included only for a request carrying a valid admin password.
 
 ## API
 
@@ -105,6 +118,7 @@ graph LR
 - `POST /api/bills/preview` — multipart form (`files`, optional `supplier`, `api_key`, `provider`) → JSON array of extracted bills. Runs no persistence.
 - `POST /api/bills/ingest` — JSON body `{results, supplier}` (`results` from `/preview`) → persists into the book of record, returns `{ingested, suppliers}`.
 - `GET /api/bills/workbook?supplier=NAME` → streams that supplier's full `.xlsx`, rebuilt from the database.
+- `GET /api/bills/search` — query `name`/`min_final_price`/`max_final_price` (everyone) and `min_base_price`/`max_base_price` (admin only) → matching lines across every supplier. Send header `X-Admin-Password: <ADMIN_PASSWORD>` to also get `rate` (base price) back per result — omitted entirely otherwise. 401 on a wrong password, 403 if a base-price filter is sent without one.
 - `POST /api/bills/extract` — multipart form, same as `/preview` plus ingestion → streams the resulting workbook directly. One-shot convenience path for scripts; requires the batch to resolve to exactly one supplier.
 
 billOCR-ui uses `/preview` then `/ingest` + `/workbook`, so previewing costs a single extraction and the workbook always reflects everything ever ingested for that supplier, not just the current upload.

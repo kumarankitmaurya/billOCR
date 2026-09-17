@@ -16,7 +16,8 @@ contract billOCR-ui depends on — nothing here is aspirational.
 ## 1. Scope
 
 **Owns:** supplier entry · photo capture/upload · a review-and-correct grid ·
-confirm · triggering the download.
+confirm · triggering the download · searching the book of record by product
+name/price (with an admin-gated base-price view — see §3's `/search` notes).
 
 **Does NOT own:** PII redaction (not yet built — see HANDOVER.md M3, still
 stubbed), OCR/extraction, price/SP calc, the workbook layout. All of that is
@@ -64,6 +65,12 @@ an endpoint that doesn't exist.
    in the response and offered as a download. There's no diff summary
    (`+new/seen/repriced`) returned or shown today — `ingest` only reports
    `{ingested, suppliers}`.
+
+**Search** is a separate, non-linear screen (reachable from Capture, not part
+of this flow) — a name/price lookup across every ingested bill via
+`GET /api/bills/search`. Public results show `final_price` only; entering a
+correct admin password (checked server-side, see §3) additionally reveals
+`rate` (base price) per result and unlocks base-price filtering.
 
 Non-goals for v1: offline queue, bulk multi-bill import, analytics.
 
@@ -120,6 +127,19 @@ POST /api/bills/extract          (multipart/form-data) — convenience only,
      400 if the batch resolves to more than one supplier without an
      explicit `supplier` — use preview -> ingest -> workbook per supplier
      instead in that case.
+
+GET  /api/bills/search           header: X-Admin-Password? (string)
+     query: name? (string, substring), min_final_price?/max_final_price?
+            (float), min_base_price?/max_base_price? (float, admin only)
+     -> [ { supplier, company, product, bill_no, bill_date, pcs: int,
+            final_price: float | null, rate?: float } ]
+     Searches every ingested line across every supplier — the whole book,
+     not one batch. `rate` (base price) is confidential: the key is absent
+     entirely (not null) unless X-Admin-Password matches settings.
+     admin_password, checked with a constant-time comparison. 401 if the
+     header is present but wrong; 403 if min_base_price/max_base_price are
+     given without a valid header. Admin access is disabled outright if
+     ADMIN_PASSWORD isn't set in .env — ships safe-by-default.
 ```
 
 Notes:
@@ -206,30 +226,37 @@ backend changes required.
 accept="image/*" capture="environment">`.
 
 **Screens:** `Capture` (supplier field, provider/API-key settings, drag-drop
-+ camera capture, thumbnails) → `Review` (the §4 grid) → `Done` (ingest
-outcome + an explicit per-supplier download button per supplier, rather than
-looping through auto-downloads, since browsers can block multiple
-simultaneous auto-triggered downloads).
++ camera capture, thumbnails, a link to `Search`) → `Review` (the §4 grid)
+→ `Done` (ingest outcome + an explicit per-supplier download button per
+supplier, rather than looping through auto-downloads, since browsers can
+block multiple simultaneous auto-triggered downloads). `Search` sits outside
+that linear chain — reachable from `Capture`, returns there — with a
+name/price-range form, an admin-password field that unlocks base-price
+results and filters, and a results list.
 
-**State:** a single Zustand store — a `screen` enum drives which of the
-three screens renders (no router: the flow is linear, matching §2's
-diagram). Supplier/provider/API-key persist to `localStorage`; the uploaded
-`File[]` and the editable OCR results live only in memory and are never
-persisted.
+**State:** a single Zustand store — a `screen` enum drives which screen
+renders (no router: the main scan flow is linear, matching §2's diagram;
+`Search` is just another value the enum can hold). Supplier/provider/API-key/
+admin-password persist to `localStorage`; the uploaded `File[]` and the
+editable OCR results live only in memory and are never persisted. Search's
+own form/results state is local to its screen component, not the store —
+nothing about a search needs to survive navigating away from it.
 
 **API layer:** `src/api/types.ts`/`client.ts` mirror `app/models.py` and
 `app/routers/bills.py` field-for-field — `Article`, `BillExtraction`,
-`ExtractionResult`, `IngestResponse`. If those Pydantic models change, these
-are the two files to update.
+`ExtractionResult`, `IngestResponse`, `SearchResultLine`. If those Pydantic
+models change, these are the two files to update.
 
-**Mocking + tests:** MSW handlers (`src/mocks/`) implement the same 4
+**Mocking + tests:** MSW handlers (`src/mocks/`) implement the same 5
 endpoints in-memory, seeded from this doc's own `output-format.md` example
-(Dindayal Jalan / DJ-STI-36600 / JAI MATA DI SRT → SAGAR, SWIGGY, GREEN TEA),
-so the UI is developable without the backend running (`VITE_USE_MOCK=true`).
-Vitest + React Testing Library screen tests cover all three §6 acceptance
-lines against those mocks. Also manually verified against this live backend
-end-to-end (real OCR call, real ingest, real `.xlsx` written to
-`OUTPUT_DIR`).
+(Dindayal Jalan / DJ-STI-36600 / JAI MATA DI SRT → SAGAR, SWIGGY, GREEN TEA)
+plus a small fixture "book" for `/search`, so the UI is developable without
+the backend running (`VITE_USE_MOCK=true`). Vitest + React Testing Library
+screen tests cover all three §6 acceptance lines plus search (public
+results, wrong-password 401, admin unlock revealing base price) against
+those mocks. Also manually verified against this live backend end-to-end
+(real OCR call, real ingest, real `.xlsx` written to `OUTPUT_DIR`, real
+`/search` calls in both public and admin mode).
 
 **Known deviations from a naive 1:1 spec port**, all deliberate:
 - No diff summary on `Done` — `/ingest` only returns `{ingested, suppliers}`,

@@ -37,6 +37,12 @@ class Settings:
     # CORS origins allowed to call the API (comma-separated).
     cors_origins: list[str] = os.getenv("CORS_ORIGINS", "*").split(",")
 
+    # Shared password gating admin-only data in /api/bills/search (base
+    # price/rate — confidential, never shown to a plain search). Empty
+    # means admin access is disabled entirely: no header value, including
+    # an empty one, will match. Set a real value in .env to enable it.
+    admin_password: str = os.getenv("ADMIN_PASSWORD", "")
+
 
 settings = Settings()
 

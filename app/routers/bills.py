@@ -2,12 +2,14 @@
 record, and downloading a supplier's workbook."""
 
 import logging
+import secrets
 
-from fastapi import APIRouter, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Form, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app import db
+from app.config import settings
 from app.models import ExtractionResult
 from app.services import excel_export
 from app.services.ocr_strategy import Provider, extract, available_providers
@@ -146,6 +148,51 @@ async def get_workbook(supplier: str) -> StreamingResponse:
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f"attachment; filename={supplier}.xlsx"},
     )
+
+
+@router.get("/search")
+async def search_bills(
+    name: str | None = None,
+    min_final_price: float | None = None,
+    max_final_price: float | None = None,
+    min_base_price: float | None = None,
+    max_base_price: float | None = None,
+    x_admin_password: str | None = Header(None),
+) -> list[dict]:
+    """Search every ingested line across every supplier, by product name
+    substring and/or price range.
+
+    Base price (`rate`) is confidential: a plain search never sees it, and
+    can't filter by it. Sending a valid `X-Admin-Password` header (matching
+    settings.admin_password) unlocks both — the header is checked with a
+    constant-time comparison, and admin access is disabled entirely if
+    ADMIN_PASSWORD isn't set (see app/config.py).
+    """
+    is_admin = False
+    if x_admin_password is not None:
+        if not settings.admin_password or not secrets.compare_digest(x_admin_password, settings.admin_password):
+            raise HTTPException(status_code=401, detail="Invalid admin password")
+        is_admin = True
+
+    if (min_base_price is not None or max_base_price is not None) and not is_admin:
+        raise HTTPException(
+            status_code=403,
+            detail="Searching by base price requires admin authentication (X-Admin-Password header)",
+        )
+
+    rows = db.search_lines(
+        name=name,
+        min_final_price=min_final_price,
+        max_final_price=max_final_price,
+        min_base_price=min_base_price,
+        max_base_price=max_base_price,
+    )
+
+    if not is_admin:
+        for row in rows:
+            del row["rate"]
+
+    return rows
 
 
 @router.post("/extract")

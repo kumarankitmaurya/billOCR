@@ -196,3 +196,71 @@ def get_workbook_data(
                 result[company_name] = bill_blocks
 
         return result
+
+
+def search_lines(
+    name: str | None = None,
+    min_final_price: float | None = None,
+    max_final_price: float | None = None,
+    min_base_price: float | None = None,
+    max_base_price: float | None = None,
+) -> list[dict]:
+    """Search every ingested line across every supplier, by product name
+    substring and/or price range.
+
+    Always includes `rate` (the confidential base price) in each row — this
+    layer doesn't know about auth; stripping `rate` for non-admin callers is
+    the router's job (see routers/bills.py).
+
+    Returns rows most-recently-billed first: [{supplier, company, product,
+    bill_no, bill_date, pcs, rate, final_price}, ...]
+    """
+    clauses = []
+    params: list[str | float] = []
+
+    if name:
+        clauses.append("line.product LIKE ?")
+        params.append(f"%{name}%")
+    if min_final_price is not None:
+        clauses.append("line.final_price >= ?")
+        params.append(min_final_price)
+    if max_final_price is not None:
+        clauses.append("line.final_price <= ?")
+        params.append(max_final_price)
+    if min_base_price is not None:
+        clauses.append("line.rate >= ?")
+        params.append(min_base_price)
+    if max_base_price is not None:
+        clauses.append("line.rate <= ?")
+        params.append(max_base_price)
+
+    where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""
+            SELECT supplier.name, company.name, line.product, bill.bill_no,
+                   bill.bill_date, line.pcs, line.rate, line.final_price
+            FROM line
+            JOIN bill ON line.bill_id = bill.id
+            JOIN company ON line.company_id = company.id
+            JOIN supplier ON bill.supplier_id = supplier.id
+            {where}
+            ORDER BY bill.bill_date DESC, bill.id DESC, line.line_order
+            """,
+            params,
+        ).fetchall()
+
+    return [
+        {
+            "supplier": supplier,
+            "company": company,
+            "product": product,
+            "bill_no": bill_no,
+            "bill_date": bill_date,
+            "pcs": pcs,
+            "rate": rate,
+            "final_price": final_price,
+        }
+        for supplier, company, product, bill_no, bill_date, pcs, rate, final_price in rows
+    ]
