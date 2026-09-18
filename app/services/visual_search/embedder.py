@@ -19,11 +19,9 @@ import numpy as np
 import onnxruntime as ort
 from PIL import Image, ImageOps, UnidentifiedImageError
 
+from app.services.visual_search.errors import ImageDecodeError, ImageTooLarge
+
 logger = logging.getLogger(__name__)
-
-
-class ImageDecodeError(ValueError):
-    """The uploaded bytes aren't an image we can read."""
 
 
 class ImageEmbedder:
@@ -118,11 +116,11 @@ class ImageEmbedder:
 def load_image(data: bytes, max_bytes: int, max_px: int = 1600) -> Image.Image:
     """Decode uploaded bytes into an image, with the size guards.
 
-    Raises ImageDecodeError for anything unreadable, and ValueError if the
+    Raises ImageDecodeError for anything unreadable, and ImageTooLarge if the
     upload is over the byte limit — the router turns those into 422 and 413.
     """
     if len(data) > max_bytes:
-        raise ValueError(f"image is {len(data) / 1_000_000:.1f}MB, limit is {max_bytes / 1_000_000:.0f}MB")
+        raise ImageTooLarge(f"image is {len(data) / 1_000_000:.1f}MB, limit is {max_bytes / 1_000_000:.0f}MB")
 
     try:
         image = Image.open(io.BytesIO(data))

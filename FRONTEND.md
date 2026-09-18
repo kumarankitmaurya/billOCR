@@ -140,6 +140,38 @@ GET  /api/bills/search           header: X-Admin-Password? (string)
      header is present but wrong; 403 if min_base_price/max_base_price are
      given without a valid header. Admin access is disabled outright if
      ADMIN_PASSWORD isn't set in .env — ships safe-by-default.
+
+GET  /api/bills/visual-search/status
+     -> { enabled, ready, model, dim, threshold, reason }
+     `ready: false` with a `reason` when the configured embedding model
+     differs from the one that built the catalog (see below).
+
+POST /api/bills/visual-search/index   (multipart/form-data, ADMIN ONLY)
+     header: X-Admin-Password (required — 401 without it)
+     fields: files[] (photos of ONE design), company, product
+     -> { company, product, indexed: [ { id, image_url } ],
+          has_price_history: bool, attrs_tagged: bool }
+     Adds catalog photos. `has_price_history: false` means no bill line
+     matches that company/product (case and outer spaces ignored) — usually
+     a typo; the photo is indexed anyway, so warn rather than block.
+
+POST /api/bills/visual-search/query   (multipart/form-data)
+     header: X-Admin-Password? (string)
+     fields: file, k? (1-20, default 8), color?/fabric?/border?/work?
+     -> { status: "match" | "no_confident_match", threshold,
+          best_score: float | null, model,
+          results: [ { company, product, score,
+                       images: [ { id, url, score } ],
+                       latest_final_price, latest_final_price_date,
+                       first_seen, last_seen, latest_rate?,
+                       history: [ { supplier, bill_no, bill_date, pcs,
+                                    final_price, rate? } ] } ] }
+     Finds designs that look like the photo. 200 whenever the search ran —
+     "nothing close enough" is `status: no_confident_match` with empty
+     results, not an error. `rate`/`latest_rate` follow the same rule as
+     /search: absent unless the admin header is valid. 413 over the upload
+     size limit, 422 for an unreadable image, 503 if visual search is
+     disabled or not ready.
 ```
 
 Notes:

@@ -2,14 +2,14 @@
 record, and downloading a supplier's workbook."""
 
 import logging
-import secrets
 
-from fastapi import APIRouter, Form, Header, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
+from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app import db
-from app.config import settings
+from app.auth import admin_access
 from app.models import ExtractionResult
 from app.services import excel_export
 from app.services.ocr_strategy import Provider, extract, available_providers
@@ -52,7 +52,10 @@ async def _extract_one(
     """
     image_bytes = await file.read()
     try:
-        return extract(
+        # In a threadpool: a 10-20s OCR call would otherwise block every
+        # other request on this instance.
+        return await run_in_threadpool(
+            extract,
             image_bytes=image_bytes,
             mime_type=file.content_type or "image/jpeg",
             filename=file.filename or "bill",
@@ -157,23 +160,15 @@ async def search_bills(
     max_final_price: float | None = None,
     min_base_price: float | None = None,
     max_base_price: float | None = None,
-    x_admin_password: str | None = Header(None),
+    is_admin: bool = Depends(admin_access),
 ) -> list[dict]:
     """Search every ingested line across every supplier, by product name
     substring and/or price range.
 
     Base price (`rate`) is confidential: a plain search never sees it, and
-    can't filter by it. Sending a valid `X-Admin-Password` header (matching
-    settings.admin_password) unlocks both — the header is checked with a
-    constant-time comparison, and admin access is disabled entirely if
-    ADMIN_PASSWORD isn't set (see app/config.py).
+    can't filter by it. A valid `X-Admin-Password` header unlocks both (see
+    app/auth.py).
     """
-    is_admin = False
-    if x_admin_password is not None:
-        if not settings.admin_password or not secrets.compare_digest(x_admin_password, settings.admin_password):
-            raise HTTPException(status_code=401, detail="Invalid admin password")
-        is_admin = True
-
     if (min_base_price is not None or max_base_price is not None) and not is_admin:
         raise HTTPException(
             status_code=403,

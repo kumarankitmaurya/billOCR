@@ -76,6 +76,40 @@ _SCHEMA = [
     # are joined on for every workbook build and every search.
     "CREATE INDEX IF NOT EXISTS line_bill_id_idx ON line (bill_id)",
     "CREATE INDEX IF NOT EXISTS line_company_id_idx ON line (company_id)",
+    # --- Visual search (app/services/visual_search) ---
+    # Catalog photos, one row per photo; a design (company, product) can have
+    # several. Linked to the bills by name, not by foreign key, because a
+    # design is photographed once but billed many times across suppliers.
+    f"""
+    CREATE TABLE IF NOT EXISTS product_image (
+        id bigserial PRIMARY KEY,
+        company text NOT NULL,
+        product text NOT NULL,
+        image_ref text NOT NULL,
+        embedding vector({int(settings.visual_embedding_dim)}),
+        attrs jsonb,
+        created_at timestamptz DEFAULT now()
+    )
+    """,
+    # Named so IF NOT EXISTS recognises it; scripts/reembed_catalog.py drops
+    # and rebuilds it by this name.
+    """
+    CREATE INDEX IF NOT EXISTS product_image_embedding_hnsw ON product_image
+        USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS product_image_design_idx
+        ON product_image (upper(btrim(company)), upper(btrim(product)))
+    """,
+    # Which model produced the stored vectors. Single row (id is always true).
+    """
+    CREATE TABLE IF NOT EXISTS visual_search_meta (
+        id boolean PRIMARY KEY DEFAULT true CHECK (id),
+        model text NOT NULL,
+        dim integer NOT NULL,
+        updated_at timestamptz NOT NULL DEFAULT now()
+    )
+    """,
 ]
 
 # Columns added after the initial release. `ADD COLUMN IF NOT EXISTS` makes

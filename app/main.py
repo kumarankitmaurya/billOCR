@@ -13,12 +13,17 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 
 from app import db
 from app.config import settings
-from app.routers import bills
+from app.routers import bills, visual_search
 
+# uvicorn configures only its own loggers; without this the app's INFO lines
+# (startup timings, visual query scores) would be dropped. On Cloud Run,
+# stderr goes straight to Cloud Logging.
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -34,6 +39,13 @@ async def lifespan(app: FastAPI):
     started = time.monotonic()
     db.init_db()
     db.open_pool()
+    app.state.visual = None
+    if settings.visual_search_enabled:
+        # Imported here so a server with visual search off never loads
+        # onnxruntime at all.
+        from app.services.visual_search import service as visual_service
+
+        app.state.visual = await run_in_threadpool(visual_service.startup)
     logger.info("startup complete in %.2fs", time.monotonic() - started)
     try:
         yield
@@ -52,3 +64,4 @@ app.add_middleware(
 )
 
 app.include_router(bills.router)
+app.include_router(visual_search.router)
