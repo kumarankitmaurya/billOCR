@@ -5,3 +5,13 @@ google-genai>=1.0.0
 groq>=0.9.0
 openpyxl>=3.1.0
 python-dotenv>=1.0.0
+psycopg[binary,pool]>=3.2
+pgvector>=0.3
+# Visual search: ONNX Runtime rather than torch — the int8 vision export is
+# ~94MB and onnxruntime's CPU wheel is a fraction of torch's, which is what
+# keeps cold starts and memory inside Cloud Run's free tier.
+onnxruntime>=1.20
+numpy>=1.26
+pillow>=10.4
+huggingface-hub>=0.26
+google-cloud-storage>=2.18

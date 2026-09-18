@@ -228,3 +228,6 @@ uploads/*
 # Generated supplier workbooks (keep the folder, ignore its contents)
 output/*
 !output/.gitkeep
+
+# Model weights, fetched by scripts/fetch_model.py (baked into the image at build time)
+models/
