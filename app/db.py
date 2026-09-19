@@ -19,7 +19,6 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import psycopg
-from pgvector.psycopg import register_vector
 from psycopg_pool import ConnectionPool
 
 from app.config import settings
@@ -30,7 +29,6 @@ logger = logging.getLogger(__name__)
 # Schema statements, applied one at a time — psycopg has no executescript().
 # All are idempotent, so this is safe to run on every startup.
 _SCHEMA = [
-    "CREATE EXTENSION IF NOT EXISTS vector",
     """
     CREATE TABLE IF NOT EXISTS supplier (
         id bigserial PRIMARY KEY,
@@ -76,40 +74,6 @@ _SCHEMA = [
     # are joined on for every workbook build and every search.
     "CREATE INDEX IF NOT EXISTS line_bill_id_idx ON line (bill_id)",
     "CREATE INDEX IF NOT EXISTS line_company_id_idx ON line (company_id)",
-    # --- Visual search (app/services/visual_search) ---
-    # Catalog photos, one row per photo; a design (company, product) can have
-    # several. Linked to the bills by name, not by foreign key, because a
-    # design is photographed once but billed many times across suppliers.
-    f"""
-    CREATE TABLE IF NOT EXISTS product_image (
-        id bigserial PRIMARY KEY,
-        company text NOT NULL,
-        product text NOT NULL,
-        image_ref text NOT NULL,
-        embedding vector({int(settings.visual_embedding_dim)}),
-        attrs jsonb,
-        created_at timestamptz DEFAULT now()
-    )
-    """,
-    # Named so IF NOT EXISTS recognises it; scripts/reembed_catalog.py drops
-    # and rebuilds it by this name.
-    """
-    CREATE INDEX IF NOT EXISTS product_image_embedding_hnsw ON product_image
-        USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS product_image_design_idx
-        ON product_image (upper(btrim(company)), upper(btrim(product)))
-    """,
-    # Which model produced the stored vectors. Single row (id is always true).
-    """
-    CREATE TABLE IF NOT EXISTS visual_search_meta (
-        id boolean PRIMARY KEY DEFAULT true CHECK (id),
-        model text NOT NULL,
-        dim integer NOT NULL,
-        updated_at timestamptz NOT NULL DEFAULT now()
-    )
-    """,
 ]
 
 # Columns added after the initial release. `ADD COLUMN IF NOT EXISTS` makes
@@ -119,8 +83,8 @@ _LINE_MIGRATIONS = [
     "margin_pct double precision",
     "tax_pct double precision",
     # From an unfinished product-photo feature on SQLite. Kept so the
-    # migration loses nothing; if it's revived it should store photos via
-    # visual_search.image_store, not a local path.
+    # migration loses nothing. Product photos now live in the separate
+    # billOCR-visual service, which stores them in object storage.
     "photo_path text",
     "photo_caption text",
 ]
@@ -130,16 +94,6 @@ _LINE_MIGRATIONS = [
 _SCHEMA_LOCK_KEY = 727001
 
 _pool: ConnectionPool | None = None
-
-
-def _configure(conn: psycopg.Connection) -> None:
-    """Prepare a pooled connection: teach psycopg the pgvector types.
-
-    The pool requires connections to be handed back outside a transaction,
-    so commit the implicit one register_vector opens.
-    """
-    register_vector(conn)
-    conn.commit()
 
 
 def open_pool() -> None:
@@ -158,7 +112,6 @@ def open_pool() -> None:
         max_idle=120,
         open=False,
         check=ConnectionPool.check_connection,
-        configure=_configure,
         kwargs={"prepare_threshold": None},
     )
     _pool.open(wait=True, timeout=30)
@@ -189,9 +142,8 @@ def _connect():
 def init_db() -> None:
     """Create the schema if it doesn't exist and apply column migrations.
 
-    Safe to call on every startup. Uses its own short-lived connection
-    rather than the pool, because the pgvector extension has to exist
-    before register_vector() can run in the pool's configure hook.
+    Safe to call on every startup, and uses its own short-lived connection
+    so the schema exists before the pool is opened.
     """
     if not settings.database_url:
         raise RuntimeError("DATABASE_URL is not set — the app has no database to talk to")

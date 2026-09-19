@@ -1,10 +1,11 @@
 """Shared fixtures for the integration tests.
 
-These go through the HTTP API into a real Postgres with pgvector — no
-mocking of the database layer, since the point of the suite is to catch the
+These go through the HTTP API into a real Postgres — no mocking of the
+database layer, since the point of the suite is to catch the
 SQLite-to-Postgres port breaking something.
 
-Start a database first:
+Start a database first (the pgvector image matches what the sibling
+billOCR-visual service needs from the same database):
 
     docker run -d --name billocr-pg -p 5433:5432 \\
         -e POSTGRES_PASSWORD=postgres pgvector/pgvector:pg17
@@ -33,19 +34,7 @@ if TEST_DATABASE_URL:
     os.environ.setdefault("OUTPUT_DIR", "/tmp/billocr-test-output")
     os.environ.setdefault("UPLOAD_DIR", "/tmp/billocr-test-uploads")
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT))
-
-# Visual search runs in the same app instance when the model has been
-# fetched (python scripts/fetch_model.py --dest ./models); otherwise its
-# tests skip and the rest of the suite runs without it.
-MODEL_PATH = ROOT / "models" / "onnx" / "vision_model_int8.onnx"
-VISUAL_AVAILABLE = MODEL_PATH.is_file()
-if TEST_DATABASE_URL and VISUAL_AVAILABLE:
-    os.environ["VISUAL_SEARCH_ENABLED"] = "true"
-    os.environ["VISUAL_MODEL_PATH"] = str(MODEL_PATH)
-    os.environ["IMAGE_STORE"] = "local"
-    os.environ.setdefault("VISUAL_ATTR_TAGGING_ENABLED", "false")
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "test-admin-pw")
 
@@ -72,14 +61,8 @@ def clean_db(client):
 
     with db._connect() as conn:
         conn.execute(
-            "TRUNCATE supplier, company, bill, line, product_image, visual_search_meta "
-            "RESTART IDENTITY CASCADE"
+            "TRUNCATE supplier, company, bill, line RESTART IDENTITY CASCADE"
         )
-    # Re-record the configured model against the now-empty catalog, as a
-    # fresh deployment would.
-    visual = getattr(client.app.state, "visual", None)
-    if visual is not None:
-        visual.state.check(force=True)
     yield
 
 
