@@ -74,10 +74,11 @@ don't coincide — deriving the book view from a relational store is far
 simpler than parsing it back out of a spreadsheet. `excel_export.py` is a
 pure read: `build_supplier_workbook()` never writes to the DB.
 
-**Cost:** the on-disk `.xlsx` files under `OUTPUT_DIR` are a cache, not a
-record — if the shop hand-edits a downloaded workbook, that edit is invisible
-to the system and gets silently clobbered the next time anyone re-downloads
-that supplier's book. There is no import path from Excel back into SQLite.
+**Cost:** a downloaded `.xlsx` is a snapshot, not a record — if the shop
+hand-edits one, that edit is invisible to the system and is absent from the
+next download. There is no import path from Excel back into the database.
+(The service itself keeps no copy: the workbook is streamed from a buffer and
+never written to disk, which is why the host needs no persistent volume.)
 
 ---
 
@@ -128,18 +129,17 @@ optional field with a plausible-looking guess.
 GET /api/bills/workbook?supplier=X
   ├─► db.get_workbook_data(X)         # read-only: {company: [(bill_no, bill_date, [lines])]}
   ├─► build one sheet per company     # _write_company_sheet, dated blocks
-  ├─► save to OUTPUT_DIR/X.xlsx       # side effect: a cache, not the record (§2)
-  └─► stream the same bytes back      # the actual HTTP response
+  └─► stream the buffer back          # the actual HTTP response; nothing on disk
 ```
 
-`build_supplier_workbook()` does the on-disk save and returns the in-memory
-buffer in the same call — both come from one `Workbook` object, so the
-downloaded file and the on-disk cache can never diverge from each other
-(they can still diverge from the DB, per §2, if hand-edited afterward).
+`build_supplier_workbook()` returns an in-memory buffer and writes nothing.
+It used to also save a copy under `OUTPUT_DIR`; that copy served nothing the
+response didn't, vanished on every container restart, and raced with itself
+when two requests for the same supplier overlapped.
 
-**Why one function does both:** simplicity — a supplier's workbook is cheap
-enough to regenerate in full on every request rather than diffed/patched, so
-there's no incremental-write path to keep correct.
+**Why it regenerates every time:** simplicity — a supplier's workbook is
+cheap enough to rebuild in full on each request rather than diffed/patched,
+so there's no incremental-write path to keep correct.
 
 **Column layout** (`_write_company_sheet`): A/B/C = product/pcs/rate always;
 D = loading, still reserved and always blank (not captured anywhere yet); E

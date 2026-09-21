@@ -1,11 +1,25 @@
 """Application settings loaded from environment variables / .env file."""
 
 import os
+import re
 
 from dotenv import load_dotenv
 
 # Load variables from a .env file in the project root, if present.
 load_dotenv()
+
+# .env.example ships placeholders like `your_gemini_api_key_here`. Copied to
+# .env and left unedited they are non-empty, so every truthiness check treats
+# them as a configured key: the provider is advertised as available, tried
+# first, and fails auth on every request before falling back. Treat them as
+# unset instead.
+_PLACEHOLDER = re.compile(r"^(your[_-]|<|changeme|xxx+$)", re.IGNORECASE)
+
+
+def _api_key(name: str) -> str | None:
+    """An API key from the environment, or None if unset or still a placeholder."""
+    value = (os.getenv(name) or "").strip()
+    return None if not value or _PLACEHOLDER.match(value) else value
 
 
 class Settings:
@@ -14,22 +28,15 @@ class Settings:
     # --- Provider API keys (set whichever ones you have) ---
 
     # Google Gemini
-    gemini_api_key: str | None = os.getenv("GEMINI_API_KEY")
+    gemini_api_key: str | None = _api_key("GEMINI_API_KEY")
     gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
     # Groq (free tier — Qwen vision). The old Llama 3.2 Vision models were
     # decommissioned; Qwen3 is the current vision-capable line on Groq.
-    groq_api_key: str | None = os.getenv("GROQ_API_KEY")
+    groq_api_key: str | None = _api_key("GROQ_API_KEY")
     groq_model: str = os.getenv("GROQ_MODEL", "qwen/qwen3.8-27b")
 
     # --- General settings ---
-
-    # Where uploaded bill images are temporarily written before OCR.
-    upload_dir: str = os.getenv("UPLOAD_DIR", "uploads")
-
-    # Where generated supplier workbooks (.xlsx) are saved on disk, in
-    # addition to being streamed back as the download response.
-    output_dir: str = os.getenv("OUTPUT_DIR", "output")
 
     # Postgres connection string for the supplier/company/bill/line book of
     # record. Use Neon's *pooled* endpoint (the `-pooler` hostname): it's
@@ -55,6 +62,7 @@ class Settings:
 
 settings = Settings()
 
-# Directories must exist before any file is written to them.
-os.makedirs(settings.upload_dir, exist_ok=True)
-os.makedirs(settings.output_dir, exist_ok=True)
+# No UPLOAD_DIR / OUTPUT_DIR: uploads are read into memory and discarded
+# (app/routers/bills.py), and workbooks are streamed from a buffer without
+# touching disk (app/services/excel_export.py). The service keeps no files,
+# which is also why its host needs no persistent disk.

@@ -31,8 +31,6 @@ if TEST_DATABASE_URL:
         )
     os.environ["DATABASE_URL"] = TEST_DATABASE_URL
     os.environ.setdefault("ADMIN_PASSWORD", "test-admin-pw")
-    os.environ.setdefault("OUTPUT_DIR", "/tmp/billocr-test-output")
-    os.environ.setdefault("UPLOAD_DIR", "/tmp/billocr-test-uploads")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 

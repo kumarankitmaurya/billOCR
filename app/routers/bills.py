@@ -2,6 +2,7 @@
 record, and downloading a supplier's workbook."""
 
 import logging
+from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -17,6 +18,17 @@ from app.services.ocr_strategy import Provider, extract, available_providers
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/bills", tags=["bills"])
+
+
+def _attachment_disposition(filename: str) -> str:
+    """Content-Disposition for a download, quoted and RFC 5987-encoded.
+
+    Supplier names contain spaces ("Dindayal Jalan.xlsx"), and an unquoted
+    filename token ends at the first one — the browser would save it as
+    "Dindayal". The ASCII fallback is for clients that ignore filename*.
+    """
+    ascii_fallback = filename.encode("ascii", "replace").decode().replace('"', "'")
+    return f"attachment; filename=\"{ascii_fallback}\"; filename*=UTF-8''{quote(filename)}"
 
 
 class IngestRequest(BaseModel):
@@ -115,10 +127,21 @@ def _ingest_results(results: list[ExtractionResult], supplier_override: str | No
             ),
         )
 
+    suppliers = _resolve_suppliers(results, supplier_override)
+    for result in results:
+        db.ingest_bill(supplier_override or result.bill.supplier, result.bill)
+    return suppliers
+
+
+def _resolve_suppliers(results: list[ExtractionResult], supplier_override: str | None) -> list[str]:
+    """The distinct suppliers these results would land under, in first-seen order.
+
+    Separate from _ingest_results so /extract can check the batch resolves to
+    one supplier *before* anything is written.
+    """
     suppliers: list[str] = []
     for result in results:
         resolved = supplier_override or result.bill.supplier
-        db.ingest_bill(resolved, result.bill)
         if resolved not in suppliers:
             suppliers.append(resolved)
     return suppliers
@@ -145,11 +168,20 @@ async def get_workbook(supplier: str) -> StreamingResponse:
         buffer = excel_export.build_supplier_workbook(supplier)
     except KeyError:
         raise HTTPException(status_code=404, detail=f"No ingested bills for supplier: {supplier}")
+    except ValueError as exc:
+        # openpyxl rejects some sheet titles outright. _safe_sheet_title should
+        # have made that impossible, so this is a 500 rather than a 4xx — but a
+        # named one, because the alternative is an opaque unhandled traceback on
+        # a supplier whose book is then silently un-downloadable.
+        logger.exception("Workbook build failed for supplier %s", supplier)
+        raise HTTPException(
+            status_code=500, detail=f"Couldn't build the workbook for {supplier}: {exc}"
+        )
 
     return StreamingResponse(
         buffer,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f"attachment; filename={supplier}.xlsx"},
+        headers={"Content-Disposition": _attachment_disposition(f"{supplier}.xlsx")},
     )
 
 
@@ -208,8 +240,11 @@ async def extract_bills(
         raise HTTPException(status_code=400, detail="No files uploaded")
 
     results = [await _extract_one(file, api_key, provider, supplier) for file in files]
-    suppliers = _ingest_results(results, supplier)
 
+    # Checked BEFORE _ingest_results: this used to persist the whole batch and
+    # only then reject it, leaving the caller with a 400 and a book of record
+    # that had already been written to.
+    suppliers = _resolve_suppliers(results, supplier)
     if len(suppliers) != 1:
         raise HTTPException(
             status_code=400,
@@ -219,4 +254,5 @@ async def extract_bills(
             ),
         )
 
+    _ingest_results(results, supplier)
     return await get_workbook(suppliers[0])

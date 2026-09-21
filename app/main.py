@@ -47,6 +47,19 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Bill OCR → Excel Service", lifespan=lifespan)
 
+
+@app.get("/health", include_in_schema=False)
+async def health() -> dict[str, str]:
+    """Liveness probe for the hosting platform.
+
+    Deliberately does not touch the database: the pool is opened in the
+    lifespan above, so a process that answers here has already connected
+    once. Making this a query would turn a brief Neon hiccup into a
+    restart loop, which is worse than serving a stale-but-alive instance.
+    """
+    return {"status": "ok"}
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,

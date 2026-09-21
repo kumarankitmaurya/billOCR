@@ -29,7 +29,6 @@ bill itself.
 
 import io
 import re
-from pathlib import Path
 
 from openpyxl import Workbook
 from openpyxl.styles import Font
@@ -37,9 +36,10 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from app import db
-from app.config import settings
 
-_UNSAFE_FILENAME_CHARS = re.compile(r'[\\/:*?"<>|]')
+# openpyxl's own INVALID_TITLE_REGEX, inlined so a version bump can't
+# silently change what we sanitise.
+_INVALID_SHEET_CHARS = re.compile(r"[\\*?:/\[\]]")
 
 
 def _autofit(sheet: Worksheet) -> None:
@@ -50,8 +50,16 @@ def _autofit(sheet: Worksheet) -> None:
 
 
 def _safe_sheet_title(name: str, used: set[str]) -> str:
-    """Excel sheet titles must be <=31 chars and unique within the workbook."""
-    title = name[:31]
+    """Excel sheet titles must be <=31 chars, unique, and free of []:*?/\\.
+
+    The character class is openpyxl's own INVALID_TITLE_REGEX. Stripping it
+    is not cosmetic: `create_sheet` raises ValueError on a hit, and mill
+    names on these bills routinely carry a slash ("M/S ...", "A/C", "S/L").
+    Without this one bad line makes that supplier's whole workbook
+    permanently un-downloadable, with no endpoint to edit the line back out.
+    """
+    title = _INVALID_SHEET_CHARS.sub("-", name).strip() or "sheet"
+    title = title[:31]
     original = title
     counter = 2
     while title in used:
@@ -86,15 +94,14 @@ def _write_company_sheet(
     _autofit(sheet)
 
 
-def _output_path(supplier_name: str) -> Path:
-    """Where this supplier's workbook is saved on disk (see settings.output_dir)."""
-    safe_name = _UNSAFE_FILENAME_CHARS.sub("_", supplier_name).strip() or "supplier"
-    return Path(settings.output_dir) / f"{safe_name}.xlsx"
-
-
 def build_supplier_workbook(supplier_name: str) -> io.BytesIO:
-    """Build the supplier's full book from the DB, save it under
-    settings.output_dir, and return it as an in-memory buffer.
+    """Build the supplier's full book from the DB and return it as a buffer.
+
+    Nothing is written to disk. The workbook is a pure view over the book of
+    record, so it can always be rebuilt; the copy this used to save under
+    OUTPUT_DIR served nothing the response doesn't, vanished on every
+    container restart, and raced with itself when two requests for the same
+    supplier overlapped.
 
     Raises KeyError if the supplier has no ingested bills.
     """
@@ -107,8 +114,6 @@ def build_supplier_workbook(supplier_name: str) -> io.BytesIO:
     for company_name, bills in data.items():
         sheet = workbook.create_sheet(_safe_sheet_title(company_name, used_titles))
         _write_company_sheet(sheet, company_name, bills)
-
-    workbook.save(_output_path(supplier_name))
 
     buffer = io.BytesIO()
     workbook.save(buffer)

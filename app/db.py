@@ -15,6 +15,7 @@ Two consequences are load-bearing below:
 
 import logging
 import time
+from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -22,7 +23,7 @@ import psycopg
 from psycopg_pool import ConnectionPool
 
 from app.config import settings
-from app.models import BillExtraction
+from app.models import Article, BillExtraction
 
 logger = logging.getLogger(__name__)
 
@@ -194,7 +195,7 @@ def _get_or_create_company(conn: psycopg.Connection, supplier_id: int, name: str
 
 def _upsert_bill(conn: psycopg.Connection, supplier_id: int, bill_no: str, bill_date: str) -> int:
     now = datetime.now(timezone.utc)
-    bill_id = conn.execute(
+    return conn.execute(
         "INSERT INTO bill (supplier_id, bill_no, bill_date, entered_at) VALUES (%s, %s, %s, %s) "
         "ON CONFLICT (supplier_id, bill_no) "
         "DO UPDATE SET bill_date = EXCLUDED.bill_date, entered_at = EXCLUDED.entered_at "
@@ -202,19 +203,51 @@ def _upsert_bill(conn: psycopg.Connection, supplier_id: int, bill_no: str, bill_
         (supplier_id, bill_no, bill_date, now),
     ).fetchone()[0]
 
-    # Re-ingesting the same bill replaces its lines rather than appending to them.
-    conn.execute("DELETE FROM line WHERE bill_id = %s", (bill_id,))
-    return bill_id
+
+def _existing_pricing(
+    conn: psycopg.Connection, bill_id: int
+) -> dict[tuple[str, str], deque[tuple[float | None, float | None, float | None]]]:
+    """The shop-entered pricing already stored for this bill, by (company, product).
+
+    tax_pct/margin_pct/final_price are typed by hand on the review screen and
+    are never printed on the bill, so OCR can never reproduce them. Re-ingest
+    replaces a bill's lines wholesale, which without this would silently wipe
+    them every time a bill is re-scanned to correct a misread rate.
+
+    A deque per key, popped in order, so a bill that lists the same product
+    twice keeps each row's own pricing rather than collapsing them.
+    """
+    rows = conn.execute(
+        "SELECT company.name, line.product, line.final_price, line.margin_pct, line.tax_pct "
+        "FROM line JOIN company ON line.company_id = company.id "
+        "WHERE line.bill_id = %s ORDER BY line.line_order",
+        (bill_id,),
+    ).fetchall()
+
+    preserved: dict[tuple[str, str], deque[tuple[float | None, float | None, float | None]]] = {}
+    for company_name, product, final_price, margin_pct, tax_pct in rows:
+        preserved.setdefault((company_name, product), deque()).append(
+            (final_price, margin_pct, tax_pct)
+        )
+    return preserved
 
 
 def ingest_bill(supplier_name: str, bill: BillExtraction) -> None:
-    """Persist one extracted bill, idempotently keyed by (supplier, bill_no)."""
+    """Persist one extracted bill, idempotently keyed by (supplier, bill_no).
+
+    Re-ingesting the same bill replaces its lines, but carries forward any
+    hand-entered pricing the payload doesn't supply — see _existing_pricing.
+    """
     with _connect() as conn:
         supplier_id = _get_or_create_supplier(conn, supplier_name)
         bill_id = _upsert_bill(conn, supplier_id, bill.bill_no, bill.bill_date)
 
+        preserved = _existing_pricing(conn, bill_id)
+        conn.execute("DELETE FROM line WHERE bill_id = %s", (bill_id,))
+
         for order, article in enumerate(bill.articles):
             company_id = _get_or_create_company(conn, supplier_id, article.company)
+            final_price, margin_pct, tax_pct = _merge_pricing(article, preserved)
             conn.execute(
                 "INSERT INTO line (bill_id, company_id, product, pcs, rate, line_order, "
                 "final_price, margin_pct, tax_pct) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
@@ -225,11 +258,29 @@ def ingest_bill(supplier_name: str, bill: BillExtraction) -> None:
                     article.pcs,
                     article.rate,
                     order,
-                    article.final_price,
-                    article.margin_pct,
-                    article.tax_pct,
+                    final_price,
+                    margin_pct,
+                    tax_pct,
                 ),
             )
+
+
+def _merge_pricing(
+    article: Article,
+    preserved: dict[tuple[str, str], deque[tuple[float | None, float | None, float | None]]],
+) -> tuple[float | None, float | None, float | None]:
+    """Payload pricing wins; anything it leaves null falls back to what was stored.
+
+    Field by field, not all-or-nothing: a re-scan that supplies only
+    final_price must not drop the tax_pct that was already there.
+    """
+    queue = preserved.get((article.company, article.product))
+    old = queue.popleft() if queue else (None, None, None)
+    return (
+        article.final_price if article.final_price is not None else old[0],
+        article.margin_pct if article.margin_pct is not None else old[1],
+        article.tax_pct if article.tax_pct is not None else old[2],
+    )
 
 
 def get_workbook_data(

@@ -116,9 +116,10 @@ POST /api/bills/ingest           (application/json)
 
 GET  /api/bills/workbook?supplier=<name>
      -> streams <name>.xlsx (application/vnd.openxmlformats-...sheet)
-     Rebuilds the workbook from the DB and also saves a copy server-side to
-     OUTPUT_DIR/<name>.xlsx (see app/config.py). 404 if the supplier has no
-     ingested bills.
+     Rebuilds the workbook from the DB on every call and streams it; nothing
+     is written server-side (the service keeps no files on disk). 404 if the
+     supplier has no ingested bills. The Content-Disposition filename is
+     quoted and RFC 5987-encoded, so supplier names with spaces survive.
 
 POST /api/bills/extract          (multipart/form-data) — convenience only,
                                   not used by billOCR-ui
@@ -260,7 +261,7 @@ the backend running (`VITE_USE_MOCK=true`). Vitest + React Testing Library
 screen tests cover all three §6 acceptance lines plus search (public
 results, wrong-password 401, admin unlock revealing base price) against
 those mocks. Also manually verified against this live backend end-to-end
-(real OCR call, real ingest, real `.xlsx` written to `OUTPUT_DIR`, real
+(real OCR call, real ingest, a real `.xlsx` streamed back, real
 `/search` calls in both public and admin mode).
 
 **Known deviations from a naive 1:1 spec port**, all deliberate:
@@ -286,6 +287,7 @@ in lockstep with `app/models.py`.
   editable in place.
 - A row whose company is renamed moves into (or creates) the matching group.
 - Clicking Download ingests the reviewed result(s) and downloads a
-  `<supplier>.xlsx` that also now exists server-side under `OUTPUT_DIR`.
+  `<supplier>.xlsx`, rebuilt from the book of record on each request. The
+  saved filename keeps its spaces (`Dindayal Jalan.xlsx`, not `Dindayal`).
 - A bill missing `bill_no`/`bill_date` is flagged in the grid and rejected at
   ingest (422) with a message naming the file, not silently guessed.
