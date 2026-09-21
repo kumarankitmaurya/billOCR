@@ -118,3 +118,19 @@ def test_placeholder_keys_read_as_unset(monkeypatch, value):
 def test_a_real_key_is_kept(monkeypatch):
     monkeypatch.setenv("SOME_API_KEY", "gsk_realkey123")
     assert _api_key("SOME_API_KEY") == "gsk_realkey123"
+
+
+def test_pricing_survives_a_company_rename_when_the_product_is_unambiguous():
+    """billOCR-ui can bulk-rename a company group; that must not drop pricing."""
+    preserved = {("OLD MILL NAME", "GREEN TEA"): deque([(670.0, 12.0, 5.0)])}
+    assert _merge_pricing(article("CORRECTED MILL", "GREEN TEA"), preserved) == (670.0, 12.0, 5.0)
+
+
+def test_a_rename_does_not_guess_between_two_mills_sharing_a_design_name():
+    """GREEN TEA exists under several mills. Rather than attribute one mill's
+    price to another's, fall back to nothing and let the reviewer re-enter."""
+    preserved = {
+        ("MILL A", "GREEN TEA"): deque([(670.0, None, None)]),
+        ("MILL B", "GREEN TEA"): deque([(890.0, None, None)]),
+    }
+    assert _merge_pricing(article("MILL C", "GREEN TEA"), preserved) == (None, None, None)

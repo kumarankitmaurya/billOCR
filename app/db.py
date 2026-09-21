@@ -275,6 +275,16 @@ def _merge_pricing(
     final_price must not drop the tax_pct that was already there.
     """
     queue = preserved.get((article.company, article.product))
+    if queue is None:
+        # The review screen can bulk-rename a company (billOCR-ui renames every
+        # row in the group at once), which changes the key and would otherwise
+        # lose the pricing the rename was never meant to touch. Fall back to
+        # the product name alone — but only when exactly one stored company
+        # used it, so this can never silently attribute one mill's price to
+        # another's identically-named design.
+        candidates = [key for key in preserved if key[1] == article.product]
+        if len(candidates) == 1:
+            queue = preserved[candidates[0]]
     old = queue.popleft() if queue else (None, None, None)
     return (
         article.final_price if article.final_price is not None else old[0],
