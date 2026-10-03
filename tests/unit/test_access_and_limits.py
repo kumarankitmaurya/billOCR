@@ -16,9 +16,13 @@ PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
 
 
 class Upload:
-    """Stand-in for UploadFile — _validate_batch only counts them."""
+    """Stand-in for UploadFile. `size` mirrors the real one: multipart sets it,
+    but it is None when the part declared no length."""
 
     filename = "bill.jpg"
+
+    def __init__(self, size: int | None = 1024):
+        self.size = size
 
 
 # --- The app-access gate --------------------------------------------------
@@ -87,16 +91,45 @@ def test_empty_upload_is_rejected():
     assert exc.value.status_code == 400
 
 
-def test_batch_over_the_cap_is_rejected(monkeypatch):
+def test_batch_over_the_file_count_cap_is_rejected(monkeypatch):
     """Each image costs an OCR call and is extracted serially at 10-20s, so an
     unbounded batch is both a cost and a request-timeout problem."""
     from app.routers import bills
 
     monkeypatch.setattr(bills.settings, "max_upload_files", 3)
-    _validate_batch([Upload()] * 3)
+    _validate_batch([Upload() for _ in range(3)])
     with pytest.raises(HTTPException) as exc:
-        _validate_batch([Upload()] * 4)
+        _validate_batch([Upload() for _ in range(4)])
     assert exc.value.status_code == 400
+
+
+def test_batch_over_the_total_body_cap_is_rejected_before_any_ocr(monkeypatch):
+    """Vercel rejects a request body over 4.5MB at the platform level, before
+    any of this code runs. Catching it here turns an opaque 413 into a message
+    naming the actual size. Two 2.7MB phone photos are over the line."""
+    from app.routers import bills
+
+    monkeypatch.setattr(bills.settings, "max_upload_files", 3)
+    monkeypatch.setattr(bills.settings, "max_request_bytes", 4 * 1024 * 1024)
+
+    one_photo = Upload(size=2_700_000)
+    _validate_batch([one_photo])  # 2.7MB — fine
+
+    with pytest.raises(HTTPException) as exc:
+        _validate_batch([Upload(size=2_700_000), Upload(size=2_500_000)])
+    assert exc.value.status_code == 413
+    assert "5.0MB" in exc.value.detail
+
+
+def test_undeclared_part_sizes_do_not_bypass_the_total_cap(monkeypatch):
+    """size is None when multipart declared no length, so _validate_batch
+    cannot check the total — the cumulative read in _extract_batch is what
+    catches it, and this asserts the up-front check at least lets it through
+    rather than erroring on None."""
+    from app.routers import bills
+
+    monkeypatch.setattr(bills.settings, "max_upload_files", 3)
+    _validate_batch([Upload(size=None), Upload(size=None)])
 
 
 def test_oversized_image_is_413(monkeypatch):

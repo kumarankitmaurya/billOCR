@@ -53,16 +53,25 @@ class Settings:
     # cap is 3 rather than 10 because every image is extracted serially at
     # 10-20s each, and a bigger batch outlives the platform's request timeout.
     max_upload_files: int = int(os.getenv("MAX_UPLOAD_FILES", "3"))
-    max_upload_bytes: int = int(os.getenv("MAX_UPLOAD_BYTES", str(12 * 1024 * 1024)))
+    max_upload_bytes: int = int(os.getenv("MAX_UPLOAD_BYTES", str(4 * 1024 * 1024)))
+
+    # Total across the whole request, not per file. Vercel Functions reject a
+    # request body over 4.5MB with a platform-level 413 before any of this
+    # code runs, so the cap sits just under that and produces a message the
+    # shopkeeper can act on instead. A 2.7MB phone photo fits; two do not —
+    # billOCR-ui needs to downscale before upload (server-side redaction
+    # cannot help here, it runs after the body has already arrived).
+    max_request_bytes: int = int(os.getenv("MAX_REQUEST_BYTES", str(4 * 1024 * 1024)))
 
     # Serve /docs and /openapi.json. Off by default: they enumerate every
     # endpoint, and /health is the liveness probe now, so nothing needs them
     # in production.
     enable_docs: bool = os.getenv("ENABLE_DOCS", "false").lower() == "true"
 
-    # Upper bound on pooled connections. Deliberately small: Cloud Run runs
-    # one worker per instance and caps instances, so a big pool buys nothing
-    # and just eats Neon's connection budget.
+    # Upper bound on pooled connections. Deliberately small: the service runs
+    # as a Vercel Function, where Fluid compute shares one instance across
+    # concurrent invocations and scales to zero. A big pool buys nothing there
+    # and just eats Neon's connection budget. See also min_size=0 in app/db.py.
     db_pool_max_size: int = int(os.getenv("DB_POOL_MAX_SIZE", "4"))
 
     # CORS origins allowed to call the API (comma-separated). No wildcard

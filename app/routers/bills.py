@@ -82,6 +82,20 @@ def _validate_batch(files: list[UploadFile]) -> None:
             ),
         )
 
+    # Multipart gives us each part's size up front, so an oversized batch is
+    # rejected before a single byte is read or a single OCR call is spent.
+    declared = sum(file.size or 0 for file in files)
+    if declared > settings.max_request_bytes:
+        raise HTTPException(status_code=413, detail=_too_large_message(declared))
+
+
+def _too_large_message(total: int) -> str:
+    return (
+        f"Upload is {total / (1024 * 1024):.1f}MB; the limit is "
+        f"{settings.max_request_bytes / (1024 * 1024):.1f}MB per request. "
+        "Send fewer bills at a time, or photograph them at a lower resolution."
+    )
+
 
 def _validate_image(filename: str, image_bytes: bytes) -> None:
     """Reject a file that is too big, or that isn't actually an image."""
@@ -101,8 +115,38 @@ def _validate_image(filename: str, image_bytes: bytes) -> None:
         )
 
 
+async def _extract_batch(
+    files: list[UploadFile],
+    api_key: str | None,
+    provider: Provider,
+    supplier: str | None,
+) -> list[ExtractionResult]:
+    """Extract every file in a validated batch, serially.
+
+    Serial on purpose: the OCR call is the whole latency budget, and running
+    them concurrently would multiply peak memory (each image is held in
+    memory and base64-inflated by a third) for no wall-clock gain once the
+    provider rate-limits. The batch size cap is what keeps the total inside
+    the platform's request timeout.
+    """
+    results: list[ExtractionResult] = []
+    budget = settings.max_request_bytes
+    for file in files:
+        image_bytes = await file.read()
+        budget -= len(image_bytes)
+        if budget < 0:
+            # Reached only when multipart didn't declare part sizes, so
+            # _validate_batch couldn't check the total up front.
+            raise HTTPException(
+                status_code=413, detail=_too_large_message(settings.max_request_bytes - budget)
+            )
+        results.append(await _extract_one(file, image_bytes, api_key, provider, supplier))
+    return results
+
+
 async def _extract_one(
     file: UploadFile,
+    image_bytes: bytes,
     api_key: str | None,
     provider: Provider = "auto",
     supplier: str | None = None,
@@ -116,7 +160,6 @@ async def _extract_one(
     text body, so the frontend's JSON-only error parsing silently loses the
     real reason and just shows "Server returned 500".
     """
-    image_bytes = await file.read()
     _validate_image(file.filename or "the file", image_bytes)
     try:
         # In a threadpool: a 10-20s OCR call would otherwise block every
@@ -161,7 +204,7 @@ async def preview_bills(
     UI, never OCR'd). If omitted, each bill's supplier is read off the image.
     """
     _validate_batch(files)
-    return [await _extract_one(file, api_key, provider, supplier) for file in files]
+    return await _extract_batch(files, api_key, provider, supplier)
 
 
 def _ingest_results(results: list[ExtractionResult], supplier_override: str | None) -> list[str]:
@@ -302,7 +345,7 @@ async def extract_bills(
     `/preview` -> `/ingest` -> `/workbook` per supplier instead.
     """
     _validate_batch(files)
-    results = [await _extract_one(file, api_key, provider, supplier) for file in files]
+    results = await _extract_batch(files, api_key, provider, supplier)
 
     # Checked BEFORE _ingest_results: this used to persist the whole batch and
     # only then reject it, leaving the caller with a 400 and a book of record
