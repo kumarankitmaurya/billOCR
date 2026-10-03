@@ -63,6 +63,11 @@ class Settings:
     # cannot help here, it runs after the body has already arrived).
     max_request_bytes: int = int(os.getenv("MAX_REQUEST_BYTES", str(4 * 1024 * 1024)))
 
+    # Create the schema at startup. True is right for local development and a
+    # first deploy; set it false once the schema exists so a serverless cold
+    # start doesn't re-run CREATE TABLE and take an advisory lock every time.
+    db_auto_init: bool = os.getenv("DB_AUTO_INIT", "true").lower() == "true"
+
     # Serve /docs and /openapi.json. Off by default: they enumerate every
     # endpoint, and /health is the liveness probe now, so nothing needs them
     # in production.

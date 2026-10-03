@@ -136,13 +136,18 @@ def close_pool() -> None:
 
 @contextmanager
 def _connect():
-    """Borrow a pooled connection.
+    """Borrow a pooled connection, opening the pool on first use.
+
+    Opening lazily rather than demanding open_pool() have run matters on a
+    serverless host: the function may be initialised without ever handling a
+    request that touches the database, and a cold start shouldn't pay for a
+    connection it may not use.
 
     Commits on success and rolls back on error, which is what the previous
     sqlite3 version did.
     """
     if _pool is None:
-        raise RuntimeError("Connection pool is not open — call open_pool() first")
+        open_pool()
     with _pool.connection() as conn:
         yield conn
 

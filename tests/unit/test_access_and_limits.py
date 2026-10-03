@@ -174,3 +174,43 @@ def test_docs_are_off_by_default():
     from app import config
 
     assert importlib.reload(config).settings.enable_docs is False
+
+
+# --- /health as a diagnostic ----------------------------------------------
+
+def _health(monkeypatch, *, database_url="postgresql://x/y", app_password="pw", startup_error=None):
+    import asyncio
+    import json
+
+    from app import main
+
+    monkeypatch.setattr(main.settings, "database_url", database_url)
+    monkeypatch.setattr(main.settings, "app_password", app_password)
+    monkeypatch.setattr(main, "_startup_error", startup_error)
+    response = asyncio.run(main.health())
+    return response.status_code, json.loads(response.body)
+
+
+def test_health_is_ok_when_configured(monkeypatch):
+    status, body = _health(monkeypatch)
+    assert (status, body) == (200, {"status": "ok"})
+
+
+def test_health_names_each_missing_setting(monkeypatch):
+    """"A server error has occurred" from the platform tells an operator
+    nothing, and /health is the only endpoint reachable without a password."""
+    status, body = _health(monkeypatch, database_url="", app_password="")
+    assert status == 503
+    joined = " ".join(body["problems"])
+    assert "DATABASE_URL" in joined and "APP_PASSWORD" in joined
+
+
+def test_health_reports_a_startup_failure_without_leaking_details(monkeypatch):
+    """A psycopg connection failure spells out every resolved host and IP of
+    the database. /health is unauthenticated, so only the class name goes out."""
+    status, body = _health(monkeypatch, startup_error="OperationalError")
+    assert status == 503
+    problem = body["problems"][0]
+    assert "OperationalError" in problem
+    for leaked in ("password", "hostaddr", "neon.tech", "5432"):
+        assert leaked not in problem

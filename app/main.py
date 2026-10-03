@@ -9,11 +9,13 @@ Run with:
 """
 
 import logging
+import sys
 import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app import db
 from app.config import settings
@@ -24,6 +26,10 @@ from app.routers import bills
 # the platform's log collector.
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+# Set when database setup failed at startup, so /health can report the reason
+# instead of leaving an operator to guess from a platform error page.
+_startup_error: str | None = None
 
 
 @asynccontextmanager
@@ -36,9 +42,24 @@ async def lifespan(app: FastAPI):
     on a scale-to-zero host these are the cold start.
     """
     started = time.monotonic()
-    db.init_db()
-    db.open_pool()
-    logger.info("startup complete in %.2fs", time.monotonic() - started)
+    try:
+        if settings.db_auto_init:
+            db.init_db()
+        db.open_pool()
+        logger.info("startup complete in %.2fs", time.monotonic() - started)
+    except Exception:
+        # Deliberately not fatal. Raising here aborts ASGI startup, which on a
+        # serverless host means every request — including /health — fails with
+        # an opaque platform-level 500, and the actual reason is only visible
+        # in the build logs. Starting anyway keeps /health answering and able
+        # to say what is wrong, which is the entire point of a health probe.
+        global _startup_error
+        # Only the exception class, never its message. /health is the one
+        # unauthenticated endpoint, and a psycopg connection failure spells out
+        # every resolved host and IP of the database — which is not something
+        # to publish. The full traceback goes to the logs instead.
+        _startup_error = type(sys.exc_info()[1]).__name__
+        logger.exception("database setup failed — serving anyway; /health will report it")
     try:
         yield
     finally:
@@ -58,15 +79,27 @@ app = FastAPI(
 
 
 @app.get("/health", include_in_schema=False)
-async def health() -> dict[str, str]:
-    """Liveness probe for the hosting platform.
+async def health() -> JSONResponse:
+    """Liveness probe, and the first place to look when a deploy misbehaves.
 
-    Deliberately does not touch the database: the pool is opened in the
-    lifespan above, so a process that answers here has already connected
-    once. Making this a query would turn a brief Neon hiccup into a
-    restart loop, which is worse than serving a stale-but-alive instance.
+    Reports configuration rather than querying the database: a probe that
+    runs a query turns a brief Neon hiccup into a restart loop. But it does
+    say whether the database is configured and whether startup succeeded,
+    because "a server error has occurred" from the platform tells an operator
+    nothing, and this is the one endpoint reachable without a password.
     """
-    return {"status": "ok"}
+    problems = []
+    if not settings.database_url:
+        problems.append("DATABASE_URL is not set")
+    if not settings.app_password:
+        problems.append("APP_PASSWORD is not set (every request will 503)")
+    if _startup_error:
+        problems.append(f"database setup failed at startup: {_startup_error} (see logs)")
+
+    body: dict[str, object] = {"status": "error" if problems else "ok"}
+    if problems:
+        body["problems"] = problems
+    return JSONResponse(body, status_code=200 if not problems else 503)
 
 
 # allow_credentials is deliberately absent: the frontend authenticates with
