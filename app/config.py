@@ -22,6 +22,16 @@ def _api_key(name: str) -> str | None:
     return None if not value or _PLACEHOLDER.match(value) else value
 
 
+def _origins(name: str) -> list[str]:
+    """A comma-separated origin list, empties dropped. No wildcard default."""
+    return [origin.strip() for origin in (os.getenv(name) or "").split(",") if origin.strip()]
+
+
+def _flag(name: str, default: bool = False) -> bool:
+    """A boolean from the environment. Anything but "true" is false."""
+    return (os.getenv(name) or str(default)).strip().lower() == "true"
+
+
 class Settings:
     """Central place for all configurable values."""
 
@@ -66,12 +76,12 @@ class Settings:
     # Create the schema at startup. True is right for local development and a
     # first deploy; set it false once the schema exists so a serverless cold
     # start doesn't re-run CREATE TABLE and take an advisory lock every time.
-    db_auto_init: bool = os.getenv("DB_AUTO_INIT", "true").lower() == "true"
+    db_auto_init: bool = _flag("DB_AUTO_INIT", True)
 
     # Serve /docs and /openapi.json. Off by default: they enumerate every
     # endpoint, and /health is the liveness probe now, so nothing needs them
     # in production.
-    enable_docs: bool = os.getenv("ENABLE_DOCS", "false").lower() == "true"
+    enable_docs: bool = _flag("ENABLE_DOCS")
 
     # Upper bound on pooled connections. Deliberately small: the service runs
     # as a Vercel Function, where Fluid compute shares one instance across
@@ -84,9 +94,16 @@ class Settings:
     # also invalid when paired with credentialed requests, so browsers
     # reject it. Unset means no cross-origin caller is allowed, which is the
     # safe direction to fail — set your frontend's real origin.
-    cors_origins: list[str] = [
-        origin.strip() for origin in os.getenv("CORS_ORIGINS", "").split(",") if origin.strip()
-    ]
+    cors_origins: list[str] = _origins("CORS_ORIGINS")
+
+    # A regex alternative, for when the caller's origin isn't a fixed string.
+    # Vercel gives every preview deployment its own hostname, so an exact list
+    # only ever matches production. Scope it to your own project rather than
+    # all of vercel.app, which would be every Vercel site on the internet:
+    #   CORS_ORIGIN_REGEX=https://billocr-ui-[a-z0-9-]+\.vercel\.app
+    # Not needed at all if the frontend proxies /api/* to this service through
+    # a Vercel rewrite, since the browser then makes no cross-origin request.
+    cors_origin_regex: str | None = os.getenv("CORS_ORIGIN_REGEX") or None
 
     # --- The two credentials ---
     #

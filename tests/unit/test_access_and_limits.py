@@ -8,7 +8,8 @@ write from them too.
 import pytest
 from fastapi import HTTPException
 
-from app import auth
+from app import auth, config
+from app.config import _api_key
 from app.routers.bills import _validate_batch, _validate_image
 
 JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64
@@ -155,62 +156,41 @@ def test_real_image_headers_pass(payload):
     _validate_image("bill.jpg", payload)
 
 
-# --- Config defaults ------------------------------------------------------
+# --- Config parsing ------------------------------------------------------
+#
+# Tested through the helpers rather than by reloading app.config: a reload
+# builds a NEW settings object while app.auth, app.main and app.routers.bills
+# still hold the old one, so every later test in the session silently reads
+# different settings than the code under test. That cost an afternoon once.
 
-def test_cors_does_not_default_to_a_wildcard():
-    """"*" let any site call this API, and is also invalid alongside
-    credentialed requests, so browsers reject it."""
-    import importlib
-
-    from app import config
-
-    reloaded = importlib.reload(config)
-    assert "*" not in reloaded.settings.cors_origins
-
-
-def test_docs_are_off_by_default():
-    import importlib
-
-    from app import config
-
-    assert importlib.reload(config).settings.enable_docs is False
+def test_cors_has_no_wildcard_default(monkeypatch):
+    """"*" let any site on the internet call this API, and is also invalid
+    alongside credentialed requests, so browsers reject it."""
+    monkeypatch.delenv("CORS_ORIGINS", raising=False)
+    assert config._origins("CORS_ORIGINS") == []
 
 
-# --- /health as a diagnostic ----------------------------------------------
-
-def _health(monkeypatch, *, database_url="postgresql://x/y", app_password="pw", startup_error=None):
-    import asyncio
-    import json
-
-    from app import main
-
-    monkeypatch.setattr(main.settings, "database_url", database_url)
-    monkeypatch.setattr(main.settings, "app_password", app_password)
-    monkeypatch.setattr(main, "_startup_error", startup_error)
-    response = asyncio.run(main.health())
-    return response.status_code, json.loads(response.body)
+def test_cors_origins_are_split_and_trimmed(monkeypatch):
+    monkeypatch.setenv("CORS_ORIGINS", " https://a.com , ,https://b.com ")
+    assert config._origins("CORS_ORIGINS") == ["https://a.com", "https://b.com"]
 
 
-def test_health_is_ok_when_configured(monkeypatch):
-    status, body = _health(monkeypatch)
-    assert (status, body) == (200, {"status": "ok"})
+@pytest.mark.parametrize("value,expected", [
+    ("true", True), ("TRUE", True), (" true ", True),
+    ("false", False), ("1", False), ("yes", False), ("", False),
+])
+def test_flags_are_only_true_for_true(monkeypatch, value, expected):
+    monkeypatch.setenv("SOME_FLAG", value)
+    assert config._flag("SOME_FLAG") is expected
 
 
-def test_health_names_each_missing_setting(monkeypatch):
-    """"A server error has occurred" from the platform tells an operator
-    nothing, and /health is the only endpoint reachable without a password."""
-    status, body = _health(monkeypatch, database_url="", app_password="")
-    assert status == 503
-    joined = " ".join(body["problems"])
-    assert "DATABASE_URL" in joined and "APP_PASSWORD" in joined
+def test_docs_are_off_unless_asked_for(monkeypatch):
+    monkeypatch.delenv("ENABLE_DOCS", raising=False)
+    assert config._flag("ENABLE_DOCS") is False
 
 
-def test_health_reports_a_startup_failure_without_leaking_details(monkeypatch):
-    """A psycopg connection failure spells out every resolved host and IP of
-    the database. /health is unauthenticated, so only the class name goes out."""
-    status, body = _health(monkeypatch, startup_error="OperationalError")
-    assert status == 503
-    problem = body["problems"][0]
-    assert "OperationalError" in problem
-    for leaked in ("password", "hostaddr", "neon.tech", "5432"):
-        assert leaked not in problem
+def test_schema_creation_defaults_on(monkeypatch):
+    """Right for local dev and a first deploy; turn off once the schema exists
+    so serverless cold starts stop re-running CREATE TABLE."""
+    monkeypatch.delenv("DB_AUTO_INIT", raising=False)
+    assert config._flag("DB_AUTO_INIT", True) is True

@@ -148,6 +148,30 @@ graph LR
 
 billOCR-ui uses `/preview` then `/ingest` + `/workbook`, so previewing costs a single extraction and the workbook always reflects everything ever ingested for that supplier, not just the current upload.
 
+## Connecting the frontend
+
+The simplest wiring, and the one that avoids CORS entirely: give **billOCR-ui**
+a `vercel.json` that proxies the API to this service, so the browser only ever
+talks to one origin.
+
+```json
+{
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "https://<this-service>.vercel.app/api/:path*" }
+  ]
+}
+```
+
+The UI then calls `/api/bills/...` relative to itself and needs no
+`VITE_API_BASE_URL` in production, and this service needs no `CORS_ORIGINS`.
+
+Cross-origin also works — set `VITE_API_BASE_URL` on the frontend and
+`CORS_ORIGINS` (or `CORS_ORIGIN_REGEX`, for preview URLs) here. It is two more
+settings to keep in sync.
+
+**Either way the frontend must send `X-App-Password` on every request.** Every
+endpoint requires it; `/health` is the only exception.
+
 ## Deploying
 
 Deployed as a **Vercel Function** (Python runtime) with **Neon Postgres**. The
@@ -173,7 +197,9 @@ Environment variables to set in the project (Settings -> Environment Variables):
 | `APP_PASSWORD` | yes | Gates every endpoint. Without it the service returns 503 to everything. |
 | `ADMIN_PASSWORD` | no | Additionally unlocks base price in `/search`. Must differ from `APP_PASSWORD`. |
 | `GROQ_API_KEY` / `GEMINI_API_KEY` | one of | A placeholder like `your_..._here` counts as unset. |
-| `CORS_ORIGINS` | if cross-origin | Unnecessary if the frontend is served from the same domain via Vercel Services. |
+| `CORS_ORIGINS` | if cross-origin | Exact origins, comma-separated. |
+| `CORS_ORIGIN_REGEX` | if cross-origin | For Vercel preview URLs, which change every deploy. Neither is needed if the frontend proxies `/api/*` here via a rewrite. |
+| `DB_AUTO_INIT` | no | Defaults true. Set `false` after the first successful deploy. |
 
 ### Two limits worth knowing
 

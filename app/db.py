@@ -97,13 +97,25 @@ _SCHEMA_LOCK_KEY = 727001
 _pool: ConnectionPool | None = None
 
 
+class DatabaseUnavailable(RuntimeError):
+    """The database can't be reached or isn't configured.
+
+    Distinct from a query failing: this says the service is misconfigured or
+    the database is down, which is a 503 the caller should retry, not a 500
+    implying a bug in the request. The frontend shows `detail` verbatim, so
+    the message is written for a shopkeeper rather than an operator.
+    """
+
+
 def open_pool() -> None:
     """Open the shared connection pool. Called once, from the app lifespan."""
     global _pool
     if _pool is not None:
         return
     if not settings.database_url:
-        raise RuntimeError("DATABASE_URL is not set — the app has no database to talk to")
+        raise DatabaseUnavailable(
+            "The service isn't connected to its database (DATABASE_URL is not set)."
+        )
 
     started = time.monotonic()
     _pool = ConnectionPool(
@@ -122,7 +134,17 @@ def open_pool() -> None:
         check=ConnectionPool.check_connection,
         kwargs={"prepare_threshold": None},
     )
-    _pool.open(wait=True, timeout=30)
+    try:
+        _pool.open(wait=True, timeout=30)
+    except Exception as exc:
+        # Don't leave a half-built pool behind for the next request to reuse.
+        _pool = None
+        logger.exception("could not open the database pool")
+        raise DatabaseUnavailable(
+            "Couldn't reach the database. This is usually a configuration or "
+            "credentials problem rather than something you did — try again, "
+            "and check the service's /health endpoint if it persists."
+        ) from exc
     logger.info("db pool opened in %.2fs", time.monotonic() - started)
 
 
@@ -159,7 +181,9 @@ def init_db() -> None:
     so the schema exists before the pool is opened.
     """
     if not settings.database_url:
-        raise RuntimeError("DATABASE_URL is not set — the app has no database to talk to")
+        raise DatabaseUnavailable(
+            "The service isn't connected to its database (DATABASE_URL is not set)."
+        )
 
     started = time.monotonic()
     with psycopg.connect(settings.database_url, prepare_threshold=None) as conn:

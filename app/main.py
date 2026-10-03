@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from psycopg import OperationalError
 
 from app import db
 from app.config import settings
@@ -106,17 +107,53 @@ async def health() -> JSONResponse:
 # the X-App-Password / X-Admin-Password headers, not cookies, so credentialed
 # requests are never made — and asking for them is what made the old wildcard
 # origin invalid, since browsers reject "*" on a credentialed request.
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=settings.cors_origins,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+@app.exception_handler(db.DatabaseUnavailable)
+async def database_unavailable(request, exc: db.DatabaseUnavailable) -> JSONResponse:
+    """503, not 500: the request was fine, the service isn't.
 
-if not settings.cors_origins:
+    Without this the frontend sees a bare 500 with no JSON body and shows
+    "Server returned 500", which sends the shopkeeper looking for a problem
+    with their photo instead of telling whoever runs the service to look at
+    /health.
+    """
+    return JSONResponse({"detail": str(exc)}, status_code=503)
+
+
+@app.exception_handler(OperationalError)
+async def database_operational_error(request, exc: OperationalError) -> JSONResponse:
+    """A connection that dies mid-request — Neon resuming from scale-to-zero,
+    a dropped pooled connection. Logged in full; the caller gets a retry hint,
+    never the driver's message, which names every host and IP it tried."""
+    logger.exception("database error while handling %s", request.url.path)
+    return JSONResponse(
+        {"detail": "The database was briefly unavailable. Please try that again."},
+        status_code=503,
+    )
+
+
+def cors_kwargs() -> dict[str, object]:
+    """The CORS policy, as a function so it can be exercised in a test.
+
+    Middleware is configured once at import, which makes the wired-up policy
+    awkward to assert on directly — a test that patches settings afterwards is
+    testing nothing. Reading it from here means the test checks the same values
+    the app runs with.
+    """
+    return {
+        "allow_origins": settings.cors_origins,
+        "allow_origin_regex": settings.cors_origin_regex,
+        "allow_methods": ["*"],
+        "allow_headers": ["*"],
+    }
+
+
+app.add_middleware(CORSMiddleware, **cors_kwargs())
+
+if not settings.cors_origins and not settings.cors_origin_regex:
     logger.warning(
-        "CORS_ORIGINS is not set — no browser origin can call this API. "
-        "Set it to the frontend's origin (e.g. https://billocr-ui.vercel.app)."
+        "Neither CORS_ORIGINS nor CORS_ORIGIN_REGEX is set — no browser origin "
+        "can call this API cross-origin. Fine if the frontend proxies /api/* to "
+        "this service through a rewrite; otherwise set one of them."
     )
 
 app.include_router(bills.router)
