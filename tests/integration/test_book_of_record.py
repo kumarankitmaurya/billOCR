@@ -3,11 +3,13 @@
 Covers what the SQLite-to-Postgres port could plausibly break: ingest and
 its idempotency, search (including the case-insensitivity that SQLite gave
 for free and Postgres doesn't), the admin gate on base price, and workbook
-generation. /preview and /extract aren't here — they call out to an LLM.
+generation, plus the app-access gate and search pagination. /preview and
+/extract aren't here — they call out to an LLM.
 """
 
 import io
 
+import pytest
 from openpyxl import load_workbook
 
 from .conftest import ADMIN_PASSWORD, make_result
@@ -136,3 +138,52 @@ def test_workbook_keeps_bills_separate_per_company(client):
     ]
     bill_header_rows = [r[0] for r in rows if r[0] in {"DJ-1", "DJ-2"}]
     assert bill_header_rows == ["DJ-1", "DJ-2"]
+
+
+# --- The app-access gate ---------------------------------------------------
+
+@pytest.mark.parametrize(
+    "method,path,kwargs",
+    [
+        ("get", "/api/bills/providers", {}),
+        ("get", "/api/bills/search", {}),
+        ("get", "/api/bills/workbook", {"params": {"supplier": "Dindayal Jalan"}}),
+        ("post", "/api/bills/ingest", {"json": {"results": []}}),
+    ],
+)
+def test_every_endpoint_refuses_an_unauthenticated_caller(anonymous_client, method, path, kwargs):
+    """Without this gate the whole book of record — every supplier, product,
+    bill number and selling price — was readable by anyone with the URL, and
+    anyone could overwrite it through /ingest."""
+    assert getattr(anonymous_client, method)(path, **kwargs).status_code == 401
+
+
+def test_a_wrong_app_password_is_rejected(anonymous_client):
+    response = anonymous_client.get("/api/bills/search", headers={"X-App-Password": "nope"})
+    assert response.status_code == 401
+
+
+def test_health_stays_open_so_the_platform_can_probe_it(anonymous_client):
+    assert anonymous_client.get("/health").status_code == 200
+
+
+def test_search_is_capped_and_pageable(client):
+    """A search with no filters used to return every line ever ingested."""
+    from app import db
+
+    articles = [
+        {"company": "MILL", "product": f"DESIGN {n}", "pcs": 1, "rate": 100.0 + n,
+         "tax_pct": None, "margin_pct": None, "final_price": 200.0 + n}
+        for n in range(5)
+    ]
+    client.post("/api/bills/ingest", json={"results": [make_result(articles=articles)]})
+
+    assert len(client.get("/api/bills/search", params={"limit": 2}).json()) == 2
+    page_one = client.get("/api/bills/search", params={"limit": 2, "offset": 0}).json()
+    page_two = client.get("/api/bills/search", params={"limit": 2, "offset": 2}).json()
+    assert page_one != page_two
+    assert client.get("/api/bills/search").status_code == 200
+    # Over the hard ceiling is rejected by FastAPI's own validation.
+    assert client.get(
+        "/api/bills/search", params={"limit": db.MAX_SEARCH_LIMIT + 1}
+    ).status_code == 422

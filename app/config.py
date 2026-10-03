@@ -46,18 +46,51 @@ class Settings:
     # writing somewhere unexpected.
     database_url: str = os.getenv("DATABASE_URL", "")
 
+    # --- Upload limits ---
+    #
+    # /preview and /extract spend a paid OCR call per image and hold each one
+    # in memory (base64 inflates it by a third), so both are bounded. The file
+    # cap is 3 rather than 10 because every image is extracted serially at
+    # 10-20s each, and a bigger batch outlives the platform's request timeout.
+    max_upload_files: int = int(os.getenv("MAX_UPLOAD_FILES", "3"))
+    max_upload_bytes: int = int(os.getenv("MAX_UPLOAD_BYTES", str(12 * 1024 * 1024)))
+
+    # Serve /docs and /openapi.json. Off by default: they enumerate every
+    # endpoint, and /health is the liveness probe now, so nothing needs them
+    # in production.
+    enable_docs: bool = os.getenv("ENABLE_DOCS", "false").lower() == "true"
+
     # Upper bound on pooled connections. Deliberately small: Cloud Run runs
     # one worker per instance and caps instances, so a big pool buys nothing
     # and just eats Neon's connection budget.
     db_pool_max_size: int = int(os.getenv("DB_POOL_MAX_SIZE", "4"))
 
-    # CORS origins allowed to call the API (comma-separated).
-    cors_origins: list[str] = os.getenv("CORS_ORIGINS", "*").split(",")
+    # CORS origins allowed to call the API (comma-separated). No wildcard
+    # default: "*" let any site on the internet call this API, and it is
+    # also invalid when paired with credentialed requests, so browsers
+    # reject it. Unset means no cross-origin caller is allowed, which is the
+    # safe direction to fail — set your frontend's real origin.
+    cors_origins: list[str] = [
+        origin.strip() for origin in os.getenv("CORS_ORIGINS", "").split(",") if origin.strip()
+    ]
 
-    # Shared password gating admin-only data in /api/bills/search (base
-    # price/rate — confidential, never shown to a plain search). Empty
-    # means admin access is disabled entirely: no header value, including
-    # an empty one, will match. Set a real value in .env to enable it.
+    # --- The two credentials ---
+    #
+    # There are deliberately two, because the shop has two roles. Staff look
+    # products up by selling price; only the owner sees what the shop paid.
+    # Collapsing them into one password would publish the cost column to
+    # everyone who can reach the API.
+
+    # APP_PASSWORD gates the API at all, as the X-App-Password header: every
+    # endpoint requires it. Empty means the service refuses every request
+    # rather than serving the whole book of record to the internet — there is
+    # no "open by default" mode. Set it in .env for local development too.
+    app_password: str = os.getenv("APP_PASSWORD", "")
+
+    # ADMIN_PASSWORD additionally unlocks base price (rate) in
+    # /api/bills/search, as the X-Admin-Password header. Empty means admin
+    # access is disabled entirely: no header value, including an empty one,
+    # will match — so `rate` is simply never returned.
     admin_password: str = os.getenv("ADMIN_PASSWORD", "")
 
 settings = Settings()

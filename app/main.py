@@ -45,7 +45,16 @@ async def lifespan(app: FastAPI):
         db.close_pool()
 
 
-app = FastAPI(title="Bill OCR → Excel Service", lifespan=lifespan)
+# /docs and /openapi.json enumerate every endpoint, and /health is the
+# liveness probe, so nothing needs them in production. ENABLE_DOCS=true turns
+# them back on for local work.
+app = FastAPI(
+    title="Bill OCR → Excel Service",
+    lifespan=lifespan,
+    docs_url="/docs" if settings.enable_docs else None,
+    redoc_url="/redoc" if settings.enable_docs else None,
+    openapi_url="/openapi.json" if settings.enable_docs else None,
+)
 
 
 @app.get("/health", include_in_schema=False)
@@ -60,12 +69,21 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+# allow_credentials is deliberately absent: the frontend authenticates with
+# the X-App-Password / X-Admin-Password headers, not cookies, so credentialed
+# requests are never made — and asking for them is what made the old wildcard
+# origin invalid, since browsers reject "*" on a credentialed request.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+if not settings.cors_origins:
+    logger.warning(
+        "CORS_ORIGINS is not set — no browser origin can call this API. "
+        "Set it to the frontend's origin (e.g. https://billocr-ui.vercel.app)."
+    )
 
 app.include_router(bills.router)

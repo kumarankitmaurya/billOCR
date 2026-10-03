@@ -108,7 +108,14 @@ def open_pool() -> None:
     started = time.monotonic()
     _pool = ConnectionPool(
         settings.database_url,
-        min_size=1,
+        # min_size=0, not 1: Neon's free plan scales the compute to zero after
+        # 5 minutes without a query, and suspending closes whatever connections
+        # are open. A pool holding a minimum of one would immediately reopen it
+        # to satisfy min_size, waking the compute — every five minutes, around
+        # the clock, which spends the 100 free compute-hours in about four days.
+        # Reachability is still checked at startup: init_db() connects directly
+        # before this runs, so an unreachable database still fails the probe.
+        min_size=0,
         max_size=settings.db_pool_max_size,
         max_idle=120,
         open=False,
@@ -346,12 +353,21 @@ def get_workbook_data(
     return result
 
 
+# A search with no filters matches the whole book, so results are always
+# capped. 200 is comfortably more than a shopkeeper reads in one go and far
+# less than an unbounded dump of every line ever ingested.
+DEFAULT_SEARCH_LIMIT = 200
+MAX_SEARCH_LIMIT = 500
+
+
 def search_lines(
     name: str | None = None,
     min_final_price: float | None = None,
     max_final_price: float | None = None,
     min_base_price: float | None = None,
     max_base_price: float | None = None,
+    limit: int = DEFAULT_SEARCH_LIMIT,
+    offset: int = 0,
 ) -> list[dict]:
     """Search every ingested line across every supplier, by product name
     substring and/or price range.
@@ -361,8 +377,11 @@ def search_lines(
     the router's job (see routers/bills.py).
 
     Returns rows most-recently-billed first: [{supplier, company, product,
-    bill_no, bill_date, pcs, rate, final_price}, ...]
+    bill_no, bill_date, pcs, rate, final_price}, ...], at most `limit` of them.
+    Page through the rest with `offset`.
     """
+    limit = max(1, min(limit, MAX_SEARCH_LIMIT))
+    offset = max(0, offset)
     clauses = []
     params: list[str | float] = []
 
@@ -396,8 +415,9 @@ def search_lines(
             JOIN supplier ON bill.supplier_id = supplier.id
             {where}
             ORDER BY bill.bill_date DESC, bill.id DESC, line.line_order
+            LIMIT %s OFFSET %s
             """,
-            params,
+            [*params, limit, offset],
         ).fetchall()
 
     return [

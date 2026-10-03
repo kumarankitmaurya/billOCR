@@ -15,10 +15,12 @@ services:
   - type: web
     name: billocr-backend
     runtime: python
-    # Starter, not Free: Free spins down when idle, so the first scan of the
-    # day would pay a cold start plus the Neon pool warm-up. Note that adding
-    # local PII redaction (HANDOVER.md M3) will need Standard for memory.
-    plan: starter
+    # Free: 750 instance-hours/month, no persistent disk needed (this service
+    # writes no files). The cost is a 30-60s cold start on the first request
+    # after idle, plus a second or two for Neon to resume — acceptable for a
+    # shop scanning a handful of bills a day. Note that adding local PII
+    # redaction (HANDOVER.md M3) will need a paid plan for memory.
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
     # A real liveness probe, so /docs doesn't have to be reachable for the
@@ -37,7 +39,14 @@ services:
         sync: false
       - key: GROQ_API_KEY
         sync: false
-      # The only credential in the system — make it long and random.
+      # REQUIRED. Gates every endpoint (X-App-Password). Without it the
+      # service returns 503 to everything rather than serving the book of
+      # record publicly. Shop staff get this one — make it long and random.
+      - key: APP_PASSWORD
+        sync: false
+      # Additionally unlocks base price in /search (X-Admin-Password). The
+      # owner gets this one. Must differ from APP_PASSWORD, or every staff
+      # member can see what the shop paid.
       - key: ADMIN_PASSWORD
         sync: false
       # Set this to your actual Vercel origin (e.g.

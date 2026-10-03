@@ -4,20 +4,26 @@ record, and downloading a supplier's workbook."""
 import logging
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, Form, HTTPException, Query, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from app import db
-from app.auth import admin_access
+from app.config import settings
+from app.auth import admin_access, require_app_access
 from app.models import ExtractionResult
 from app.services import excel_export
 from app.services.ocr_strategy import Provider, extract, available_providers
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/api/bills", tags=["bills"])
+# The app-access gate is declared on the router, not per endpoint, so a new
+# endpoint is private by default — forgetting to add it can't quietly publish
+# the book of record. Base price stays separately gated (see /search).
+router = APIRouter(
+    prefix="/api/bills", tags=["bills"], dependencies=[Depends(require_app_access)]
+)
 
 
 def _attachment_disposition(filename: str) -> str:
@@ -47,6 +53,54 @@ async def list_providers() -> list[dict]:
     return available_providers()
 
 
+# The first bytes of the formats a phone camera produces. Checked instead of
+# trusting file.content_type, which is whatever the client chose to send.
+_IMAGE_MAGIC = (
+    b"\xff\xd8\xff",      # JPEG
+    b"\x89PNG\r\n\x1a\n",  # PNG
+    b"RIFF",              # WebP (RIFF....WEBP)
+    b"II*\x00",           # TIFF little-endian
+    b"MM\x00*",           # TIFF big-endian
+)
+
+
+def _validate_batch(files: list[UploadFile]) -> None:
+    """Reject an upload that is empty or larger than this service will carry.
+
+    Each image costs an OCR call and is held in memory through a base64
+    expansion, and they are extracted serially at 10-20s each — so an
+    unbounded batch is both a cost and a request-timeout problem.
+    """
+    if not files:
+        raise HTTPException(status_code=400, detail="No files uploaded")
+    if len(files) > settings.max_upload_files:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Too many files ({len(files)}); this service takes at most "
+                f"{settings.max_upload_files} per upload. Send them in smaller batches."
+            ),
+        )
+
+
+def _validate_image(filename: str, image_bytes: bytes) -> None:
+    """Reject a file that is too big, or that isn't actually an image."""
+    if len(image_bytes) > settings.max_upload_bytes:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"{filename} is {len(image_bytes) // (1024 * 1024)}MB; the limit is "
+                f"{settings.max_upload_bytes // (1024 * 1024)}MB. Photograph the bill "
+                "at a lower resolution."
+            ),
+        )
+    if not image_bytes.startswith(_IMAGE_MAGIC):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{filename} doesn't look like an image (JPEG, PNG, WebP or TIFF).",
+        )
+
+
 async def _extract_one(
     file: UploadFile,
     api_key: str | None,
@@ -63,6 +117,7 @@ async def _extract_one(
     real reason and just shows "Server returned 500".
     """
     image_bytes = await file.read()
+    _validate_image(file.filename or "the file", image_bytes)
     try:
         # In a threadpool: a 10-20s OCR call would otherwise block every
         # other request on this instance.
@@ -75,11 +130,19 @@ async def _extract_one(
             api_key=api_key,
             supplier=supplier,
         )
-    except Exception as exc:
-        logger.warning("Extraction failed for %s: %s", file.filename, exc)
+    except HTTPException:
+        raise
+    except Exception:
+        # Logged, not returned: provider SDK exceptions carry request URLs,
+        # model ids and occasionally fragments of credentials, and this detail
+        # goes straight to the client.
+        logger.exception("Extraction failed for %s", file.filename)
         raise HTTPException(
             status_code=502,
-            detail=f"Couldn't read {file.filename or 'the bill'}: {exc}",
+            detail=(
+                f"Couldn't read {file.filename or 'the bill'}. Retake the photo with "
+                "more light and the whole bill in frame, or try another provider."
+            ),
         )
 
 
@@ -97,9 +160,7 @@ async def preview_bills(
     of being read off the image (see HANDOVER.md: supplier is chosen in the
     UI, never OCR'd). If omitted, each bill's supplier is read off the image.
     """
-    if not files:
-        raise HTTPException(status_code=400, detail="No files uploaded")
-
+    _validate_batch(files)
     return [await _extract_one(file, api_key, provider, supplier) for file in files]
 
 
@@ -192,6 +253,8 @@ async def search_bills(
     max_final_price: float | None = None,
     min_base_price: float | None = None,
     max_base_price: float | None = None,
+    limit: int = Query(db.DEFAULT_SEARCH_LIMIT, ge=1, le=db.MAX_SEARCH_LIMIT),
+    offset: int = Query(0, ge=0),
     is_admin: bool = Depends(admin_access),
 ) -> list[dict]:
     """Search every ingested line across every supplier, by product name
@@ -213,6 +276,8 @@ async def search_bills(
         max_final_price=max_final_price,
         min_base_price=min_base_price,
         max_base_price=max_base_price,
+        limit=limit,
+        offset=offset,
     )
 
     if not is_admin:
@@ -236,9 +301,7 @@ async def extract_bills(
     resolves to more than one distinct supplier via OCR, use
     `/preview` -> `/ingest` -> `/workbook` per supplier instead.
     """
-    if not files:
-        raise HTTPException(status_code=400, detail="No files uploaded")
-
+    _validate_batch(files)
     results = [await _extract_one(file, api_key, provider, supplier) for file in files]
 
     # Checked BEFORE _ingest_results: this used to persist the whole batch and

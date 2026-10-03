@@ -30,10 +30,12 @@ if TEST_DATABASE_URL:
             "Set ALLOW_REMOTE_TEST_DB=1 only if you are certain it's a scratch branch."
         )
     os.environ["DATABASE_URL"] = TEST_DATABASE_URL
+    os.environ.setdefault("APP_PASSWORD", "test-app-pw")
     os.environ.setdefault("ADMIN_PASSWORD", "test-admin-pw")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+APP_PASSWORD = os.environ.get("APP_PASSWORD", "test-app-pw")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "test-admin-pw")
 
 
@@ -46,10 +48,28 @@ def client():
 
     from app.main import app
 
+    # Every endpoint requires X-App-Password, so it goes on the client as a
+    # default header rather than onto 30-odd individual calls. httpx merges
+    # per-request headers with these, so a test passing X-Admin-Password still
+    # carries the app password too.
+    #
     # The `with` is what runs the lifespan, which is what creates the schema
     # and opens the pool.
-    with TestClient(app) as test_client:
+    with TestClient(app, headers={"X-App-Password": APP_PASSWORD}) as test_client:
         yield test_client
+
+
+@pytest.fixture(scope="session")
+def anonymous_client(client):
+    """A client that sends no credentials, for asserting the gate is shut.
+
+    Depends on `client` so the app's lifespan has already run.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    return TestClient(app)
 
 
 @pytest.fixture(autouse=True)
