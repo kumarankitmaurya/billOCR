@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 # Load variables from a .env file in the project root, if present.
 load_dotenv()
 
-# .env.example ships placeholders like `your_gemini_api_key_here`. Copied to
+# .env.example ships placeholders like `your_api_key_here`. Copied to
 # .env and left unedited they are non-empty, so every truthiness check treats
 # them as a configured key: the provider is advertised as available, tried
 # first, and fails auth on every request before falling back. Treat them as
@@ -36,10 +36,6 @@ class Settings:
     """Central place for all configurable values."""
 
     # --- Provider API keys (set whichever ones you have) ---
-
-    # Google Gemini
-    gemini_api_key: str | None = _api_key("GEMINI_API_KEY")
-    gemini_model: str = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
     # Groq (free tier — Qwen vision). The old Llama 3.2 Vision models were
     # decommissioned; Qwen3 is the current vision-capable line on Groq.

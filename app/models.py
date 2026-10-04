@@ -1,7 +1,7 @@
 """Pydantic schemas shared by the OCR services, the API layer, and the Excel exporter.
 
-The same `BillExtraction` model doubles as the Gemini `response_schema`, so its
-field descriptions double as extraction instructions for the model.
+Field descriptions double as extraction instructions: they are read by the
+vision model as part of the prompt.
 
 Fields match the textile bill contract in output-format.md: a bill's
 DESCRIPTION column stacks company (mill/brand) and product (design name), and
@@ -61,7 +61,7 @@ class ExtractionResult(BaseModel):
     """Wraps a BillExtraction with metadata about which engine produced it."""
 
     source_filename: str
-    engine: str  # "gemini" or "groq"
+    engine: str  # which provider read it, e.g. "groq"
     bill: BillExtraction
     flags: list[str] = Field(
         default_factory=list,

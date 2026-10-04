@@ -3,7 +3,7 @@
 API-only backend for turning photos of textile trade bills into a
 per-supplier Excel book matching the shop's existing ledger (one sheet per
 company/mill, each bill a dated block of product/pcs/rate rows). Uses
-**Google Gemini** or **Groq** (Qwen Vision) to read the bill; ingested bills
+**Groq** (Qwen Vision) to read the bill; ingested bills
 persist in Postgres (Neon) so the workbook can always be rebuilt or
 re-downloaded later.
 
@@ -54,7 +54,7 @@ pip install -r requirements.txt
 
 This reads `requirements.txt` and installs FastAPI, the Gemini and Groq SDKs, the Excel generation library, etc.
 
-### 5. Set up your Gemini or Groq API key
+### 5. Set up your Groq API key
 
 Get a free key from [Google AI Studio](https://aistudio.google.com/apikey). You have two options:
 

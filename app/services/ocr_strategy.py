@@ -1,12 +1,9 @@
-"""OCR provider strategy — selects and runs the best available vision model.
+"""OCR provider strategy — selects and runs a vision model.
 
-Provider priority:
-1. If the caller explicitly picks a provider (via the UI dropdown), use that.
-2. Otherwise, auto-select based on which API keys are configured:
-   Gemini → Groq.
-
-Each provider is attempted in order; if one fails, the next is tried
-automatically so the user always gets a result.
+Groq is the only provider. The try-in-order machinery below is kept rather
+than collapsed into a single call, because it is what makes adding a second
+provider a one-entry change — and with one provider there is no fallback at
+all, so a bad day at Groq is an outage.
 """
 
 import logging
@@ -15,20 +12,15 @@ from typing import Literal
 
 from app.config import settings
 from app.models import BillExtraction, ExtractionResult
-from app.services import gemini_ocr, groq_ocr
+from app.services import groq_ocr
 
 logger = logging.getLogger(__name__)
 
 # The set of providers the user can pick from.
-Provider = Literal["auto", "gemini", "groq"]
+Provider = Literal["auto", "groq"]
 
 # Maps provider names to (extract_fn, needs_api_key_field).
 _PROVIDERS = {
-    "gemini": {
-        "extract": gemini_ocr.extract_bill_data,
-        "key_field": "gemini_api_key",
-        "label": "gemini",
-    },
     "groq": {
         "extract": groq_ocr.extract_bill_data,
         "key_field": "groq_api_key",
@@ -44,19 +36,11 @@ def _auto_order(api_key: str | None) -> list[str]:
     it belongs to, so we try all of them.  Otherwise we only try providers
     whose server-side key is set.
     """
-    order: list[str] = []
-
     if api_key:
-        # User provided a key — try both cloud providers.
-        order = ["gemini", "groq"]
-    else:
-        # Use whichever server-side keys are configured.
-        if settings.gemini_api_key:
-            order.append("gemini")
-        if settings.groq_api_key:
-            order.append("groq")
-
-    return order
+        # A key supplied from the UI; we cannot tell which provider it belongs
+        # to, so try everything we have.
+        return list(_PROVIDERS)
+    return [name for name in _PROVIDERS if getattr(settings, _PROVIDERS[name]["key_field"])]
 
 
 def extract(
@@ -78,7 +62,7 @@ def extract(
         try_order = [provider]
 
     if not try_order:
-        raise ValueError("No OCR provider available: configure GEMINI_API_KEY or GROQ_API_KEY")
+        raise ValueError("No OCR provider available: configure GROQ_API_KEY")
 
     last_error: Exception | None = None
 
@@ -130,11 +114,6 @@ def available_providers() -> list[dict]:
     """
     providers = [{"id": "auto", "name": "Auto (best available)", "available": True}]
 
-    providers.append({
-        "id": "gemini",
-        "name": "Google Gemini",
-        "available": bool(settings.gemini_api_key),
-    })
     providers.append({
         "id": "groq",
         "name": "Groq (Qwen Vision)",

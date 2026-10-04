@@ -106,7 +106,7 @@ def test_non_ascii_filename_keeps_an_ascii_fallback():
 
 # --- Placeholder API keys count as unset ----------------------------------
 
-@pytest.mark.parametrize("value", ["your_gemini_api_key_here", "YOUR-KEY", "", "   ", "<paste here>"])
+@pytest.mark.parametrize("value", ["your_api_key_here", "YOUR-KEY", "", "   ", "<paste here>"])
 def test_placeholder_keys_read_as_unset(monkeypatch, value):
     """An unedited .env.example placeholder is non-empty, so every truthiness
     check used to treat it as configured: the provider was advertised as
