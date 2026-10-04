@@ -17,7 +17,7 @@ from .conftest import ADMIN_PASSWORD, make_result
 ADMIN = {"X-Admin-Password": ADMIN_PASSWORD}
 
 
-def test_ingest_persists_and_is_idempotent(client):
+def test_ingest_persists_and_is_idempotent(client, supplier):
     payload = {"results": [make_result()], "supplier": "Dindayal Jalan"}
 
     first = client.post("/api/bills/ingest", json=payload)
@@ -33,14 +33,14 @@ def test_ingest_persists_and_is_idempotent(client):
     assert len(rows) == 1
 
 
-def test_ingest_rejects_missing_bill_no(client):
+def test_ingest_rejects_missing_bill_no(client, supplier):
     payload = {"results": [make_result(bill_no=None, source_filename="blurry.jpg")]}
     response = client.post("/api/bills/ingest", json=payload)
     assert response.status_code == 422
     assert "blurry.jpg" in response.json()["detail"]
 
 
-def test_search_is_case_insensitive_and_filters_on_final_price(client):
+def test_search_is_case_insensitive_and_filters_on_final_price(client, supplier):
     client.post("/api/bills/ingest", json={"results": [make_result()]})
 
     # SQLite's LIKE ignored case; Postgres's doesn't, hence ILIKE in db.py.
@@ -52,7 +52,7 @@ def test_search_is_case_insensitive_and_filters_on_final_price(client):
     assert len(client.get("/api/bills/search", params={"max_final_price": 700}).json()) == 1
 
 
-def test_base_price_is_admin_only(client):
+def test_base_price_is_admin_only(client, supplier):
     client.post("/api/bills/ingest", json={"results": [make_result()]})
 
     public = client.get("/api/bills/search", params={"name": "GREEN"}).json()
@@ -72,7 +72,7 @@ def test_base_price_is_admin_only(client):
     assert filtered.json() == []
 
 
-def test_workbook_groups_by_company_and_404s_for_unknown_supplier(client):
+def test_workbook_groups_by_company_and_404s_for_unknown_supplier(client, supplier):
     articles = [
         {
             "company": "JAI MATA DI SRT",
@@ -112,7 +112,7 @@ def test_workbook_groups_by_company_and_404s_for_unknown_supplier(client):
     assert missing.status_code == 404
 
 
-def test_workbook_keeps_bills_separate_per_company(client):
+def test_workbook_keeps_bills_separate_per_company(client, supplier):
     """Two bills for one company must stay two dated blocks, not merge."""
     first = make_result(bill_no="DJ-1", bill_date="2025-08-17")
     second = make_result(
@@ -167,7 +167,7 @@ def test_health_stays_open_so_the_platform_can_probe_it(anonymous_client):
     assert anonymous_client.get("/health").status_code == 200
 
 
-def test_search_is_capped_and_pageable(client):
+def test_search_is_capped_and_pageable(client, supplier):
     """A search with no filters used to return every line ever ingested."""
     from app import db
 

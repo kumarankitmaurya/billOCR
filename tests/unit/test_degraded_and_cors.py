@@ -9,8 +9,16 @@ from starlette.testclient import TestClient
 
 
 def client(monkeypatch, **env):
-    """A TestClient with settings patched before the lifespan runs."""
-    from app import config, main
+    """A TestClient with settings patched before the lifespan runs.
+
+    Also clears the module-level connection pool. Without that, an integration
+    run earlier in the session leaves a working pool open, _connect() uses it
+    regardless of settings.database_url, and "no database configured" quietly
+    simulates nothing at all.
+    """
+    from app import config, db, main
+
+    monkeypatch.setattr(db, "_pool", None)
 
     for key, value in env.items():
         monkeypatch.setattr(config.settings, key, value)

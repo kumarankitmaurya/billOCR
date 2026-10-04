@@ -97,6 +97,14 @@ _SCHEMA_LOCK_KEY = 727001
 _pool: ConnectionPool | None = None
 
 
+class UnknownSupplier(ValueError):
+    """A bill named a supplier that is not in the book's supplier set."""
+
+    def __init__(self, name: str):
+        super().__init__(name)
+        self.name = name
+
+
 class DatabaseUnavailable(RuntimeError):
     """The database can't be reached or isn't configured.
 
@@ -197,19 +205,41 @@ def init_db() -> None:
     logger.info("init_db finished in %.2fs", time.monotonic() - started)
 
 
-def _get_or_create_supplier(conn: psycopg.Connection, name: str) -> int:
+def _supplier_id(conn: psycopg.Connection, name: str) -> int:
+    """The id of an existing supplier. Never creates one.
+
+    Supplier is a closed set, and this is where that is enforced. It used to
+    get-or-create, which meant any spelling became a new supplier — and since
+    supplier is the workbook key, one supplier typed two ways silently became
+    two ledgers that no price search could join. That is not a hypothetical:
+    the book arrived with "Dindayal Jalan" and "Dindayal Jalan Textiles
+    Pvt.Ltd" holding two copies of the same bill.
+    """
     row = conn.execute("SELECT id FROM supplier WHERE name = %s", (name,)).fetchone()
-    if row:
-        return row[0]
-    # Unlike SQLite, Postgres allows genuinely concurrent writers, so another
-    # caller may insert between the SELECT above and this INSERT.
-    row = conn.execute(
-        "INSERT INTO supplier (name) VALUES (%s) ON CONFLICT (name) DO NOTHING RETURNING id",
-        (name,),
-    ).fetchone()
-    if row:
-        return row[0]
-    return conn.execute("SELECT id FROM supplier WHERE name = %s", (name,)).fetchone()[0]
+    if not row:
+        raise UnknownSupplier(name)
+    return row[0]
+
+
+def list_suppliers() -> list[str]:
+    """Every supplier the book will accept, for the UI to choose from."""
+    with _connect() as conn:
+        return [r[0] for r in conn.execute("SELECT name FROM supplier ORDER BY name").fetchall()]
+
+
+def add_supplier(name: str) -> bool:
+    """Add a supplier to the set. True if created, False if it already existed.
+
+    Deliberately a separate, admin-gated action rather than a side effect of
+    ingesting: adding a supplier is a decision about the shape of the book,
+    and making it implicit is what produced the duplicates.
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            "INSERT INTO supplier (name) VALUES (%s) ON CONFLICT (name) DO NOTHING RETURNING id",
+            (name,),
+        ).fetchone()
+        return row is not None
 
 
 def _get_or_create_company(conn: psycopg.Connection, supplier_id: int, name: str) -> int:
@@ -276,7 +306,7 @@ def ingest_bill(supplier_name: str, bill: BillExtraction) -> None:
     hand-entered pricing the payload doesn't supply — see _existing_pricing.
     """
     with _connect() as conn:
-        supplier_id = _get_or_create_supplier(conn, supplier_name)
+        supplier_id = _supplier_id(conn, supplier_name)
         bill_id = _upsert_bill(conn, supplier_id, bill.bill_no, bill.bill_date)
 
         preserved = _existing_pricing(conn, bill_id)

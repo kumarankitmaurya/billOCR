@@ -48,10 +48,14 @@ should be updated alongside it; until then, don't build a polling UI against
 an endpoint that doesn't exist.
 
 ### Screens
-1. **Supplier** — a free-text field (not a picker from a backend list — there
-   is no `/suppliers` endpoint). Persisted in `localStorage` so it carries
-   across bills in a session. If left blank, each bill's supplier is read off
-   the image by the OCR model instead.
+1. **Supplier** — a **picker**, fed by `GET /api/bills/suppliers`. Supplier is
+   a closed set: `/preview` and `/ingest` both 422 on anything else, and the
+   OCR model is no longer asked to read it off the image. This replaced a
+   free-text field, which produced two ledgers for one supplier — a human
+   types the short name the shop uses while OCR reads the full legal name off
+   the letterhead. `HANDOVER.md` §3 always said supplier is chosen in the UI
+   and never OCR'd; the closed set is what enforces it. A new supplier is
+   added by the owner via `POST /api/bills/suppliers` (admin only).
 2. **Capture** — drag-and-drop, file browse, or camera capture; multi-file.
 3. **Reading** — one `POST /api/bills/preview` call per batch; no
    stage-by-stage progress (there's no redact/extract/reconcile pipeline to

@@ -1,7 +1,8 @@
-"""Bill extraction using Groq's Llama Vision API (free tier).
+"""Bill extraction using Groq's vision model.
 
-Groq provides fast inference on open-source models. We use Llama Vision
-which can read bill images and return structured JSON.
+The model is Qwen (see GROQ_MODEL in app/config.py) — the Llama Vision models
+this originally used were decommissioned. Groq is the only provider, so a
+failure here is a failed scan, not a fallback.
 """
 
 import base64
@@ -58,12 +59,18 @@ Rules:
 
 
 def _supplier_context(supplier: str | None) -> str:
-    if supplier:
-        return (
-            f'The supplier is exactly "{supplier}" — use this value for the '
-            '"supplier" field. Do not read a different seller name off the image.'
-        )
-    return 'Read the seller/supplier name from the bill header and put it in the "supplier" field.'
+    """Supplier is always supplied now, and always trusted.
+
+    The branch that asked the model to read the seller name off the letterhead
+    is gone. It is what produced two ledgers for one supplier — a human types
+    the short name the shop uses, while OCR reads the full legal name off the
+    header. HANDOVER.md §3 always said supplier is chosen in the UI and never
+    OCR'd; a closed supplier set is what finally makes that true.
+    """
+    return (
+        f'The supplier is exactly "{supplier}" — use this value for the '
+        '"supplier" field. Do not read a different seller name off the image.'
+    )
 
 
 def extract_bill_data(
@@ -72,10 +79,10 @@ def extract_bill_data(
     supplier: str | None = None,
     api_key: str | None = None,
 ) -> BillExtraction:
-    """Send a bill image to Groq Llama Vision and return the parsed BillExtraction.
+    """Send a bill image to Groq and return the parsed BillExtraction.
 
-    Raises whatever exception the SDK raises (e.g. auth or network errors)
-    so the caller can decide whether to fall back to another provider.
+    Raises whatever exception the SDK raises (e.g. auth or network errors);
+    ocr_strategy logs it with a traceback and reports the failure.
     """
     key = api_key or settings.groq_api_key
     if not key:

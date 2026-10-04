@@ -157,6 +157,20 @@ async def database_unavailable(request, exc: db.DatabaseUnavailable) -> JSONResp
     return JSONResponse({"detail": str(exc)}, status_code=503)
 
 
+@app.exception_handler(db.UnknownSupplier)
+async def unknown_supplier(request, exc: db.UnknownSupplier) -> JSONResponse:
+    """422: the request named a supplier the book does not have.
+
+    A backstop. The routers check the whole batch up front so nothing is
+    half-written; this catches any other caller reaching the data layer.
+    """
+    logger.warning("unknown supplier reached the data layer: %s", exc.name)
+    return JSONResponse(
+        {"detail": f"Unknown supplier: {exc.name}. Add it first (admin), or pick an existing one."},
+        status_code=422,
+    )
+
+
 @app.exception_handler(OperationalError)
 async def database_operational_error(request, exc: OperationalError) -> JSONResponse:
     """A connection that dies mid-request — Neon resuming from scale-to-zero,

@@ -217,15 +217,22 @@ dependencies — see Vercel's Docker guide for Python.
 
 ### Running the tests against a database
 
-The integration suite `TRUNCATE`s every table, so point it at a scratch Neon
-**branch**, never the live one:
+The integration suite `TRUNCATE`s every table, so it needs a scratch database
+— never the live one. A separate database inside the same Neon project is the
+cheapest option (`CREATE DATABASE billocr_test` once, over the direct
+endpoint), or use a Neon branch.
 
 ```bash
-TEST_DATABASE_URL='<scratch branch pooled string>' ALLOW_REMOTE_TEST_DB=1 pytest
+# Note the DIRECT endpoint (no `-pooler`): tests/integration/test_sqlite_migration.py
+# runs the migration script, which refuses a pooled connection string.
+TEST_DATABASE_URL='postgresql://...@ep-xxx.REGION.aws.neon.tech/billocr_test?sslmode=require' \
+  ALLOW_REMOTE_TEST_DB=1 pytest
 ```
 
 `ALLOW_REMOTE_TEST_DB=1` is required because `conftest.py` refuses any
-`neon.tech` URL by default. The unit tests in `tests/unit/` need no database.
+`neon.tech` URL by default — the suite truncates everything, and that guard is
+what stops it being pointed at production. The unit tests in `tests/unit/`
+need no database and run on a bare `pytest`.
 
 ## Design notes
 

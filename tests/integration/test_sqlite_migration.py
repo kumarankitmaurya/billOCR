@@ -11,7 +11,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .conftest import TEST_DATABASE_URL, make_result
+from .conftest import ADMIN_PASSWORD, TEST_DATABASE_URL, make_result
 
 SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "migrate_sqlite_to_neon.py"
 
@@ -80,6 +80,17 @@ def test_migration_copies_rows_with_ids_and_resets_sequences(client, tmp_path):
 
     # ...and new writes don't collide with the copied ids. Without setval
     # this would fail on the primary key of supplier/company/bill/line.
+    #
+    # Adding the supplier explicitly is now the insert most likely to collide:
+    # the migration copied a supplier with id 3, so the sequence has to have
+    # been advanced past it. (It used to be created implicitly by ingest,
+    # which supplier being a closed set no longer allows.)
+    added = client.post(
+        "/api/bills/suppliers", json={"name": "New Supplier"},
+        headers={"X-Admin-Password": ADMIN_PASSWORD},
+    )
+    assert added.status_code == 201, added.text
+
     new = make_result(supplier="New Supplier", bill_no="NS-1")
     response = client.post("/api/bills/ingest", json={"results": [new]})
     assert response.status_code == 200, response.text
@@ -88,7 +99,7 @@ def test_migration_copies_rows_with_ids_and_resets_sequences(client, tmp_path):
     assert workbook.status_code == 200
 
 
-def test_migration_refuses_a_non_empty_target(client, tmp_path):
+def test_migration_refuses_a_non_empty_target(client, supplier, tmp_path):
     client.post("/api/bills/ingest", json={"results": [make_result()]})
 
     sqlite_path = tmp_path / "bills.db"

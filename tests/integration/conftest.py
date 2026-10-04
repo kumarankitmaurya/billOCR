@@ -84,6 +84,23 @@ def clean_db(client):
     yield
 
 
+@pytest.fixture
+def supplier(client):
+    """Seed the default supplier and return its name.
+
+    Opt-in rather than autouse: supplier is a closed set now, so anything that
+    ingests needs one to exist first — but the migration tests require a
+    genuinely empty target, so seeding globally would break them.
+    """
+    name = "Dindayal Jalan"
+    response = client.post(
+        "/api/bills/suppliers", json={"name": name},
+        headers={"X-Admin-Password": ADMIN_PASSWORD},
+    )
+    assert response.status_code in (201, 200), response.text
+    return name
+
+
 def make_result(
     *,
     supplier="Dindayal Jalan",

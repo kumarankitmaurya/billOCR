@@ -11,7 +11,7 @@ from pydantic import BaseModel
 
 from app import db
 from app.config import settings
-from app.auth import admin_access, require_app_access
+from app.auth import admin_access, require_admin, require_app_access
 from app.models import ExtractionResult
 from app.services import excel_export
 from app.services.ocr_strategy import Provider, extract, available_providers
@@ -47,6 +47,36 @@ class IngestResponse(BaseModel):
     suppliers: list[str]
 
 
+class SupplierRequest(BaseModel):
+    name: str
+
+
+@router.get("/suppliers")
+async def list_suppliers() -> list[str]:
+    """The suppliers this book accepts — the set the UI must choose from.
+
+    Served from the database rather than hardcoded so the frontend, which is
+    deployed separately, cannot drift from what ingest will actually accept.
+    """
+    return await run_in_threadpool(db.list_suppliers)
+
+
+@router.post("/suppliers", status_code=201)
+async def add_supplier(payload: SupplierRequest, _: None = Depends(require_admin)) -> dict:
+    """Add a supplier. Admin only — this changes the shape of the book.
+
+    Deliberately not something a scan can do as a side effect: implicit
+    creation is what let one supplier become two ledgers.
+    """
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=422, detail="Supplier name cannot be blank")
+
+    created = await run_in_threadpool(db.add_supplier, name)
+    logger.info("supplier %s: %s", "created" if created else "already present", name)
+    return {"name": name, "created": created}
+
+
 @router.get("/providers")
 async def list_providers() -> list[dict]:
     """Return the available OCR providers so the frontend can build a dropdown."""
@@ -62,6 +92,27 @@ _IMAGE_MAGIC = (
     b"II*\x00",           # TIFF little-endian
     b"MM\x00*",           # TIFF big-endian
 )
+
+
+async def _require_known_supplier(supplier: str | None) -> None:
+    """Reject an unknown supplier before a single OCR call is paid for.
+
+    Checked here as well as at ingest because an OCR call costs money and
+    20 seconds: finding out at save time that the supplier was wrong wastes
+    both. HANDOVER.md §3 locks this decision — "supplier is chosen in the UI,
+    never OCR'd" — and a closed set is what finally enforces it.
+    """
+    known = await run_in_threadpool(db.list_suppliers)
+    if not supplier or supplier.strip() not in known:
+        logger.warning("refused: unknown supplier %r", supplier)
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Unknown supplier {supplier!r}. Choose one of: {', '.join(known)}."
+                if known
+                else "No suppliers have been set up yet. Add one first (admin)."
+            ),
+        )
 
 
 def _validate_batch(files: list[UploadFile]) -> None:
@@ -215,6 +266,7 @@ async def preview_bills(
     UI, never OCR'd). If omitted, each bill's supplier is read off the image.
     """
     _validate_batch(files)
+    await _require_known_supplier(supplier)
     return await _extract_batch(files, api_key, provider, supplier)
 
 
@@ -245,6 +297,22 @@ def _ingest_results(results: list[ExtractionResult], supplier_override: str | No
         )
 
     suppliers = _resolve_suppliers(results, supplier_override)
+
+    # Checked for the whole batch first. db.ingest_bill would raise on the
+    # first unknown name, but by then earlier bills in the batch are already
+    # committed — the same half-written-then-rejected shape /extract had.
+    known = set(db.list_suppliers())
+    unknown = [s for s in suppliers if s not in known]
+    if unknown:
+        logger.warning("refused ingest: unknown supplier(s) %s", ", ".join(unknown))
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Unknown supplier(s): {', '.join(unknown)}. "
+                f"Choose from: {', '.join(sorted(known)) or '(none set up yet)'}."
+            ),
+        )
+
     for result in results:
         db.ingest_bill(supplier_override or result.bill.supplier, result.bill)
     return suppliers
@@ -359,6 +427,7 @@ async def extract_bills(
     `/preview` -> `/ingest` -> `/workbook` per supplier instead.
     """
     _validate_batch(files)
+    await _require_known_supplier(supplier)
     results = await _extract_batch(files, api_key, provider, supplier)
 
     # Checked BEFORE _ingest_results: this used to persist the whole batch and
