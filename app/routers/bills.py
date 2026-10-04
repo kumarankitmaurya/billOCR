@@ -74,6 +74,9 @@ def _validate_batch(files: list[UploadFile]) -> None:
     if not files:
         raise HTTPException(status_code=400, detail="No files uploaded")
     if len(files) > settings.max_upload_files:
+        logger.warning(
+            "refused upload: %d files, limit %d", len(files), settings.max_upload_files
+        )
         raise HTTPException(
             status_code=400,
             detail=(
@@ -86,6 +89,13 @@ def _validate_batch(files: list[UploadFile]) -> None:
     # rejected before a single byte is read or a single OCR call is spent.
     declared = sum(file.size or 0 for file in files)
     if declared > settings.max_request_bytes:
+        # Worth watching: a steady stream of these means billOCR-ui's
+        # client-side downscale is not running in the shop's browser.
+        logger.warning(
+            "refused upload: %.1fMB across %d files, limit %.1fMB",
+            declared / (1024 * 1024), len(files),
+            settings.max_request_bytes / (1024 * 1024),
+        )
         raise HTTPException(status_code=413, detail=_too_large_message(declared))
 
 
@@ -109,6 +119,7 @@ def _validate_image(filename: str, image_bytes: bytes) -> None:
             ),
         )
     if not image_bytes.startswith(_IMAGE_MAGIC):
+        logger.warning("refused %s: first bytes are not a known image format", filename)
         raise HTTPException(
             status_code=400,
             detail=f"{filename} doesn't look like an image (JPEG, PNG, WebP or TIFF).",
@@ -222,6 +233,8 @@ def _ingest_results(results: list[ExtractionResult], supplier_override: str | No
         if not result.bill.bill_no or not result.bill.bill_date
     ]
     if missing:
+        # The most likely thing a shopkeeper reports as "it won't save".
+        logger.warning("refused ingest: bill_no/bill_date missing for %s", ", ".join(missing))
         raise HTTPException(
             status_code=422,
             detail=(
@@ -271,6 +284,7 @@ async def get_workbook(supplier: str) -> StreamingResponse:
     try:
         buffer = excel_export.build_supplier_workbook(supplier)
     except KeyError:
+        logger.warning("workbook requested for unknown supplier: %s", supplier)
         raise HTTPException(status_code=404, detail=f"No ingested bills for supplier: {supplier}")
     except ValueError as exc:
         # openpyxl rejects some sheet titles outright. _safe_sheet_title should

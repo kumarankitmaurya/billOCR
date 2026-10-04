@@ -130,12 +130,13 @@ def open_pool() -> None:
         min_size=0,
         max_size=settings.db_pool_max_size,
         max_idle=120,
+        timeout=settings.db_connect_timeout,
         open=False,
         check=ConnectionPool.check_connection,
         kwargs={"prepare_threshold": None},
     )
     try:
-        _pool.open(wait=True, timeout=30)
+        _pool.open(wait=True, timeout=settings.db_connect_timeout)
     except Exception as exc:
         # Don't leave a half-built pool behind for the next request to reuse.
         _pool = None

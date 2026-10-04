@@ -41,6 +41,13 @@ def require_app_access(x_app_password: str | None = Header(None)) -> None:
     if x_app_password is None or not secrets.compare_digest(
         x_app_password, settings.app_password
     ):
+        # Which of the two it was, but never the value itself. A burst of
+        # "missing" means a client that was never configured; a burst of
+        # "wrong" means a stale password or someone guessing.
+        logger.warning(
+            "rejected: %s X-App-Password",
+            "missing" if x_app_password is None else "wrong",
+        )
         raise HTTPException(
             status_code=401, detail="Missing or invalid X-App-Password header"
         )
@@ -58,6 +65,7 @@ def admin_access(x_admin_password: str | None = Header(None)) -> bool:
     if not settings.admin_password or not secrets.compare_digest(
         x_admin_password, settings.admin_password
     ):
+        logger.warning("rejected: wrong X-Admin-Password (base price stays hidden)")
         raise HTTPException(status_code=401, detail="Invalid admin password")
     return True
 

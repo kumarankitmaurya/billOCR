@@ -89,6 +89,14 @@ class Settings:
     # and just eats Neon's connection budget. See also min_size=0 in app/db.py.
     db_pool_max_size: int = int(os.getenv("DB_POOL_MAX_SIZE", "4"))
 
+    # How long a request waits for a connection before giving up. Short on
+    # purpose: with an unreachable database the pool's default made every
+    # request hang 30s before returning the 503 it was always going to return,
+    # which reads as "the app is broken" rather than "the database is down".
+    # Neon resuming from scale-to-zero takes a second or two, so this still
+    # leaves room for a cold database.
+    db_connect_timeout: float = float(os.getenv("DB_CONNECT_TIMEOUT", "8"))
+
     # CORS origins allowed to call the API (comma-separated). No wildcard
     # default: "*" let any site on the internet call this API, and it is
     # also invalid when paired with credentialed requests, so browsers

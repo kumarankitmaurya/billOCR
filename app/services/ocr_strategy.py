@@ -10,6 +10,7 @@ automatically so the user always gets a result.
 """
 
 import logging
+import time
 from typing import Literal
 
 from app.config import settings
@@ -83,16 +84,30 @@ def extract(
 
     for name in try_order:
         info = _PROVIDERS[name]
+        started = time.monotonic()
         try:
-            logger.info("Trying provider: %s", name)
             bill = info["extract"](image_bytes, mime_type, supplier, api_key)
+            # Timing is the whole latency budget of a scan, and which provider
+            # actually answered is not otherwise visible once a fallback has
+            # kicked in. Line counts, never line contents.
+            logger.info(
+                "%s read %s in %.1fs: %d articles, bill_no=%s",
+                name, filename, time.monotonic() - started,
+                len(bill.articles), "yes" if bill.bill_no else "MISSING",
+            )
             return ExtractionResult(
                 source_filename=filename, engine=info["label"], bill=bill, flags=_quality_flags(bill)
             )
         except Exception as exc:
-            logger.warning("%s extraction failed for %s: %s", name, filename, exc)
+            # exception(), not warning(): a provider failure is the single most
+            # common real fault here, and the traceback is what distinguishes
+            # an auth problem from a timeout from an unparseable response.
+            logger.exception(
+                "%s failed on %s after %.1fs", name, filename, time.monotonic() - started
+            )
             last_error = exc
 
+    logger.error("every provider failed for %s (tried: %s)", filename, ", ".join(try_order))
     raise last_error
 
 

@@ -13,19 +13,19 @@ import sys
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from psycopg import OperationalError
 
-from app import db
+from app import db, logs
 from app.config import settings
 from app.routers import bills
 
 # uvicorn configures only its own loggers; without this the app's INFO lines
 # (startup timings) would be dropped. On a hosted runtime, stderr goes to
 # the platform's log collector.
-logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(name)s: %(message)s")
+logs.configure(logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Set when database setup failed at startup, so /health can report the reason
@@ -107,6 +107,44 @@ async def health() -> JSONResponse:
 # the X-App-Password / X-Admin-Password headers, not cookies, so credentialed
 # requests are never made — and asking for them is what made the old wildcard
 # origin invalid, since browsers reject "*" on a credentialed request.
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    """One line per request, and the id that ties it to everything else.
+
+    Deliberately logs the path and status but never the body: a bill payload
+    carries the shop's own cost and margin figures, and an upload carries
+    image bytes. 4xx is logged at WARNING because that is where a
+    misconfigured client shows up — a wall of 401s means the frontend lost its
+    password, and those used to leave no trace at all.
+    """
+    token = logs.current_request_id.set(logs.new_request_id(request.headers.get("x-vercel-id")))
+    started = time.monotonic()
+    try:
+        try:
+            response = await call_next(request)
+        except Exception:
+            # Starlette would turn this into a bare 500 with nothing logged by us.
+            logger.exception(
+                "unhandled error: %s %s after %.2fs",
+                request.method,
+                request.url.path,
+                time.monotonic() - started,
+            )
+            raise
+
+        level = logging.INFO if response.status_code < 400 else logging.WARNING
+        logger.log(
+            level, "%s %s -> %s in %.2fs", request.method, request.url.path,
+            response.status_code, time.monotonic() - started,
+        )
+        return response
+    finally:
+        # Reset last. An earlier version reset in a `finally` that ran before
+        # the summary log, so the one line most worth correlating was the only
+        # line without an id on it.
+        logs.current_request_id.reset(token)
+
+
 @app.exception_handler(db.DatabaseUnavailable)
 async def database_unavailable(request, exc: db.DatabaseUnavailable) -> JSONResponse:
     """503, not 500: the request was fine, the service isn't.
