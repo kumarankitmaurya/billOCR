@@ -19,6 +19,15 @@ class Article(BaseModel):
     product: str = Field(..., description="Design name, e.g. 'MILK CAKE'")
     pcs: int = Field(..., description="Piece count for this line")
     rate: float = Field(..., description="Price per piece")
+    amount: float | None = Field(
+        None,
+        description=(
+            "Line total as printed on the bill (the AMOUNT column), or null if "
+            "not legible. Read it even though it is not stored: it is the only "
+            "redundancy the bill carries, and amount vs pcs*rate is what "
+            "catches a misread price."
+        ),
+    )
     final_price: float | None = Field(
         None,
         description=(

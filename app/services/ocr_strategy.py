@@ -95,8 +95,50 @@ def extract(
     raise last_error
 
 
+# How far amount may differ from pcs * rate before it is worth a second look.
+# Loose on purpose: the bill has a discount column this service does not
+# capture, and metre-billed rows price per metre rather than per piece, so a
+# tight tolerance would flag rows that are perfectly fine and train the
+# shopkeeper to ignore the banner. Only a mismatch too large to be either.
+_RECONCILE_TOLERANCE = 0.05
+_RECONCILE_FLOOR = 2.0
+
+
+def _reconciliation_flags(bill: BillExtraction) -> list[str]:
+    """Flag rows where the printed amount doesn't match pcs * rate.
+
+    The bill prints its own line totals, which is the only redundancy it
+    carries — and the thing that catches a misread price. A skewed or
+    unflattened photo makes the model pick up a digit from the row above, and
+    nothing downstream would ever notice: the number looks perfectly ordinary,
+    it just isn't what the bill says.
+
+    This flags rather than rejects. The shop knows which of its suppliers
+    discount a line, and a wrong flag costs a glance where a missed misread
+    costs a wrong price in the book for good.
+    """
+    mismatched = []
+    for article in bill.articles:
+        if article.amount is None or article.amount == 0:
+            continue
+        expected = article.pcs * article.rate
+        slack = max(_RECONCILE_FLOOR, abs(article.amount) * _RECONCILE_TOLERANCE)
+        if abs(expected - article.amount) > slack:
+            mismatched.append(
+                f"{article.product} ({article.pcs} x {article.rate:g} = {expected:g}, "
+                f"bill says {article.amount:g})"
+            )
+
+    if not mismatched:
+        return []
+    return [
+        f"{len(mismatched)} of {len(bill.articles)} lines don't match the bill's own "
+        f"totals — check pcs and price on: {'; '.join(mismatched)}"
+    ]
+
+
 def _quality_flags(bill: BillExtraction) -> list[str]:
-    """Flag fields the model couldn't confidently read instead of letting a
+    """Flag what the model couldn't confidently read instead of letting a
     fabricated value pass through silently (see HANDOVER.md §4: never
     silently accept a mismatch/guess)."""
     flags: list[str] = []
@@ -104,6 +146,19 @@ def _quality_flags(bill: BillExtraction) -> list[str]:
         flags.append("bill_no not detected — enter it manually before saving")
     if not bill.bill_date:
         flags.append("bill_date not detected — enter it manually before saving")
+    if not bill.articles:
+        flags.append("no article lines were read — retake the photo straight on")
+
+    flags.extend(_reconciliation_flags(bill))
+
+    unreadable = sum(1 for a in bill.articles if a.amount is None)
+    if bill.articles and unreadable == len(bill.articles):
+        # Nothing to reconcile against, so every price on this bill is
+        # unverified. Worth saying so rather than looking clean.
+        flags.append(
+            "the AMOUNT column wasn't legible, so prices could not be "
+            "cross-checked — verify them against the bill"
+        )
     return flags
 
 

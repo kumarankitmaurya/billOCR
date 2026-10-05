@@ -9,7 +9,7 @@ import base64
 import logging
 
 # pyrefly: ignore [missing-import]
-from groq import Groq
+from groq import Groq, RateLimitError
 
 from app.config import settings
 from app.models import BillExtraction
@@ -25,8 +25,20 @@ The bill's DESCRIPTION column stacks TWO things per row — split them:
   company  the mill / brand printed with the line (e.g. ROHAN FAB SRT, JAI MATA DI SRT, SIYARAM)
   product  the design name (e.g. MILK CAKE, ANARKALI, GREEN TEA)
 
-Per row, also read pcs (piece count) and rate (price per piece). Ignore and do
-not include amount, discount, gst, hsn/code, or mtr — they are out of scope.
+Per row, read pcs (piece count), rate (price per piece), and amount (the
+printed line total). Ignore discount, gst, hsn/code and mtr — out of scope.
+
+The amount matters even though it is not stored: amount should equal
+pcs * rate, and that is how a misread price gets caught. Read it as printed —
+never compute it, and never adjust rate or pcs to make the arithmetic work. A
+row that does not add up must come back not adding up.
+
+The photo may be skewed, rotated, or of a page that was not lying flat. Follow
+each row along its own baseline rather than along a straight horizontal line,
+because a tilted page makes a value from the row above or below look aligned
+with this one. If a cell is genuinely unreadable return null for that field
+rather than borrowing the neighbouring row's value or inventing a plausible
+number.
 
 Numbers: strip commas/symbols so they are plain numbers (e.g. "4,000.00" -> 4000).
 Skip summary rows (Total C/F, CGST, SGST, Grand Total) and amount-in-words.
@@ -49,7 +61,7 @@ Return a JSON object with this exact schema:
   "bill_date": "YYYY-MM-DD or null",
   "articles": [
     {{ "company": "string", "product": "string", "pcs": "int", "rate": "number",
-       "final_price": null, "margin_pct": null }}
+       "amount": "number or null", "final_price": null, "margin_pct": null }}
   ]
 }}
 
@@ -70,6 +82,39 @@ def _supplier_context(supplier: str | None) -> str:
     return (
         f'The supplier is exactly "{supplier}" — use this value for the '
         '"supplier" field. Do not read a different seller name off the image.'
+    )
+
+
+def _complete(client: "Groq", image_url: str, prompt: str):
+    """The provider call itself, kept separate so the error handling above
+    reads as a list of failure modes rather than wrapping a 20-line call."""
+    return client.chat.completions.create(
+        model=settings.groq_model,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": image_url},
+                    },
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    },
+                ],
+            }
+        ],
+        # 0, not 0.1: this is transcription, and the same photo should give
+        # the same answer twice.
+        temperature=0,
+        # Back to 4096 after 8192 proved counter-productive: Groq's on-demand
+        # tier caps output tokens per minute, and a request whose expected
+        # output exceeds the remaining budget is rejected outright rather than
+        # queued. A long bill needs ~1100 output tokens, so this is already
+        # generous — and the truncation check below is what makes an
+        # over-long bill fail loudly instead of silently losing its last rows.
+        max_tokens=4096,
     )
 
 
@@ -96,28 +141,35 @@ def extract_bill_data(
 
     prompt = _PROMPT_TEMPLATE.format(supplier_context=_supplier_context(supplier))
 
-    response = client.chat.completions.create(
-        model=settings.groq_model,
-        messages=[
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": image_url},
-                    },
-                    {
-                        "type": "text",
-                        "text": prompt,
-                    },
-                ],
-            }
-        ],
-        temperature=0.1,
-        max_tokens=4096,
-    )
+    try:
+        response = _complete(client, image_url, prompt)
+    except RateLimitError as exc:
+        # Groq's free tier allows ~1000 output tokens a minute and one bill
+        # costs roughly 1100, so a second bill inside the same minute is
+        # refused. Worth saying plainly: the generic provider error reads as
+        # "the scan failed" when the scan was fine and merely too soon.
+        raise RuntimeError(
+            "The OCR provider's per-minute limit was reached — this plan allows "
+            "about one bill a minute. Wait a moment and scan this bill again, or "
+            "upgrade the Groq plan to scan several at once."
+        ) from exc
 
-    raw_text = response.choices[0].message.content.strip()
+    if not response.choices:
+        raise ValueError("Groq returned no choices")
+
+    choice = response.choices[0]
+    # A truncated response is the dangerous failure here: the JSON is cut off
+    # mid-array, so without this check a long bill silently loses its last
+    # rows rather than failing.
+    if choice.finish_reason == "length":
+        raise ValueError(
+            "The model's reply was cut off before the bill ended — the bill has "
+            "more rows than one response can hold. Photograph it in two halves."
+        )
+    if choice.message.content is None:
+        raise ValueError("Groq returned an empty reply (refusal or tool call)")
+
+    raw_text = choice.message.content.strip()
 
     # Strip markdown fences if the model wraps the JSON in ```json ... ```
     if raw_text.startswith("```"):

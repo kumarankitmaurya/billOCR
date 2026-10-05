@@ -58,7 +58,12 @@ class Settings:
     # in memory (base64 inflates it by a third), so both are bounded. The file
     # cap is 3 rather than 10 because every image is extracted serially at
     # 10-20s each, and a bigger batch outlives the platform's request timeout.
-    max_upload_files: int = int(os.getenv("MAX_UPLOAD_FILES", "3"))
+    # 1, not 3: Groq's on-demand tier allows ~1000 output tokens a minute and
+    # a single bill costs roughly 1100, so a second bill in the same request is
+    # refused outright. A cap of 3 did not batch three bills, it produced one
+    # success and two confusing failures. Raise this the day the Groq plan is
+    # raised, not before.
+    max_upload_files: int = int(os.getenv("MAX_UPLOAD_FILES", "1"))
     max_upload_bytes: int = int(os.getenv("MAX_UPLOAD_BYTES", str(4 * 1024 * 1024)))
 
     # Total across the whole request, not per file. Vercel Functions reject a
