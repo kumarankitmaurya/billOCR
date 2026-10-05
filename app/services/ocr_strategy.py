@@ -12,7 +12,7 @@ from typing import Literal
 
 from app.config import settings
 from app.models import BillExtraction, ExtractionResult
-from app.services import groq_ocr
+from app.services import groq_ocr, image_prep
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +80,13 @@ def extract(
                 len(bill.articles), "yes" if bill.bill_no else "MISSING",
             )
             return ExtractionResult(
-                source_filename=filename, engine=info["label"], bill=bill, flags=_quality_flags(bill)
+                source_filename=filename,
+                engine=info["label"],
+                bill=bill,
+                # Skew is measured from the photo rather than inferred from the
+                # result: a tilted page is the cause, and saying so lets the
+                # shopkeeper fix it instead of hunting for the wrong row.
+                flags=image_prep.skew_flags(image_bytes) + _quality_flags(bill),
             )
         except Exception as exc:
             # exception(), not warning(): a provider failure is the single most
@@ -137,6 +143,28 @@ def _reconciliation_flags(bill: BillExtraction) -> list[str]:
     ]
 
 
+def _uniform_read_flags(bill: BillExtraction) -> list[str]:
+    """Catch a read where every line came back the same.
+
+    This is what a badly degraded image produces — not a plausible-looking
+    wrong number, but the same number on every row. It was found by accident:
+    an image-preprocessing attempt returned all eight rows as
+    "5 x 540754, amount 2703770". Reconciliation is blind to it, because a
+    uniform read is internally consistent (5 x 540754 really is 2703770), so
+    it needs its own check.
+    """
+    if len(bill.articles) < 3:
+        return []
+    rates = {a.rate for a in bill.articles}
+    if len(rates) == 1:
+        return [
+            f"every one of the {len(bill.articles)} lines came back at the same price "
+            f"({rates.pop():g}) — that is what an unreadable photo looks like, not a bill. "
+            "Retake it with more light and the page flat."
+        ]
+    return []
+
+
 def _quality_flags(bill: BillExtraction) -> list[str]:
     """Flag what the model couldn't confidently read instead of letting a
     fabricated value pass through silently (see HANDOVER.md §4: never
@@ -149,6 +177,7 @@ def _quality_flags(bill: BillExtraction) -> list[str]:
     if not bill.articles:
         flags.append("no article lines were read — retake the photo straight on")
 
+    flags.extend(_uniform_read_flags(bill))
     flags.extend(_reconciliation_flags(bill))
 
     unreadable = sum(1 for a in bill.articles if a.amount is None)
