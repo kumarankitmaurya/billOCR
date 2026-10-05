@@ -52,6 +52,27 @@ class Settings:
     # writing somewhere unexpected.
     database_url: str = os.getenv("DATABASE_URL", "")
 
+    # --- The shop's pricing rule (see app/services/pricing.py) ---
+    #
+    # Defaults the review screen pre-fills, not fixed values: every one stays
+    # editable per line. Changing them here changes what a new bill arrives
+    # with; it never rewrites a price already saved.
+    default_tax_pct: float = float(os.getenv("DEFAULT_TAX_PCT", "5"))
+    # Compared against the BILL RATE, before tax — the number printed on the
+    # bill. Comparing the tax-inclusive price instead would move rates between
+    # ~1429 and 1500 up a tier.
+    margin_threshold: float = float(os.getenv("MARGIN_THRESHOLD", "1500"))
+    margin_pct_below: float = float(os.getenv("MARGIN_PCT_BELOW", "15"))
+    margin_pct_above: float = float(os.getenv("MARGIN_PCT_ABOVE", "17"))
+    # Added before rounding, so the shelf price lands on a tidy number.
+    sell_price_nudge: float = float(os.getenv("SELL_PRICE_NUDGE", "8"))
+    sell_price_round_to: int = int(os.getenv("SELL_PRICE_ROUND_TO", "5"))
+    # The nudge applies only above this COMPUTED price. Below it, the price is
+    # rounded up instead, which keeps it above the computed figure without one.
+    sell_price_nudge_above: float = float(os.getenv("SELL_PRICE_NUDGE_ABOVE", "1000"))
+    # Where a price landing on x05 is pushed to instead.
+    sell_price_ugly_step: int = int(os.getenv("SELL_PRICE_UGLY_STEP", "20"))
+
     # --- Upload limits ---
     #
     # /preview and /extract spend a paid OCR call per image and hold each one

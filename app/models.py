@@ -32,7 +32,9 @@ class Article(BaseModel):
         None,
         description=(
             "Selling price the shop sets for this line. Never printed on the bill — "
-            "always return null; it's filled in by hand during review, same as SP."
+            "always return null. The server then pre-fills it from the shop's "
+            "pricing rule (app/services/pricing.py), and the review screen can "
+            "still overwrite it."
         ),
     )
     margin_pct: float | None = Field(

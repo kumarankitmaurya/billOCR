@@ -13,7 +13,7 @@ from app import db
 from app.config import settings
 from app.auth import admin_access, require_admin, require_app_access
 from app.models import ExtractionResult
-from app.services import excel_export
+from app.services import excel_export, pricing
 from app.services.ocr_strategy import Provider, extract, available_providers
 
 logger = logging.getLogger(__name__)
@@ -75,6 +75,17 @@ async def add_supplier(payload: SupplierRequest, _: None = Depends(require_admin
     created = await run_in_threadpool(db.add_supplier, name)
     logger.info("supplier %s: %s", "created" if created else "already present", name)
     return {"name": name, "created": created}
+
+
+@router.get("/pricing")
+async def pricing_policy() -> dict:
+    """The shop's pricing rule, for the UI to apply as the shopkeeper edits.
+
+    Served rather than duplicated in the frontend for the same reason the
+    supplier list is: the two deploy separately, and a pricing rule that
+    drifts from the backend's is worse than no copy at all.
+    """
+    return pricing.policy()
 
 
 @router.get("/providers")

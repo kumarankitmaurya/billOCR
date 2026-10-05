@@ -12,7 +12,7 @@ from typing import Literal
 
 from app.config import settings
 from app.models import BillExtraction, ExtractionResult
-from app.services import groq_ocr, image_prep
+from app.services import groq_ocr, image_prep, pricing
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +71,7 @@ def extract(
         started = time.monotonic()
         try:
             bill = info["extract"](image_bytes, mime_type, supplier, api_key)
+            _apply_pricing_defaults(bill)
             # Timing is the whole latency budget of a scan, and which provider
             # actually answered is not otherwise visible once a fallback has
             # kicked in. Line counts, never line contents.
@@ -163,6 +164,30 @@ def _uniform_read_flags(bill: BillExtraction) -> list[str]:
             "Retake it with more light and the page flat."
         ]
     return []
+
+
+def _apply_pricing_defaults(bill: BillExtraction) -> None:
+    """Pre-fill tax, margin and selling price on every line.
+
+    The shopkeeper used to type all three on each line of every bill. The rule
+    is the same every time (see app/services/pricing.py), so the review screen
+    now opens with it applied and the shopkeeper only corrects the exceptions.
+
+    Only fills what is empty. A value already present came from somewhere
+    deliberate and is never overwritten.
+    """
+    for article in bill.articles:
+        defaults = pricing.defaults_for(article.rate)
+        if article.tax_pct is None:
+            article.tax_pct = defaults["tax_pct"]
+        if article.margin_pct is None:
+            article.margin_pct = defaults["margin_pct"]
+        if article.final_price is None:
+            # Recomputed from whatever tax/margin this line ended up with,
+            # so a line that already carried one of them keeps it honest.
+            article.final_price = float(
+                pricing.sell_price(article.rate, article.tax_pct, article.margin_pct)
+            )
 
 
 def _quality_flags(bill: BillExtraction) -> list[str]:
