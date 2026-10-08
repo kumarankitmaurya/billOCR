@@ -50,11 +50,13 @@ def extract(
     provider: Provider = "auto",
     api_key: str | None = None,
     supplier: str | None = None,
+    margin_rules: pricing.MarginRules | None = None,
 ) -> ExtractionResult:
     """Run bill extraction using the selected (or auto-detected) provider.
 
     Tries each candidate provider in order and raises the last error if all
-    of them fail.
+    of them fail. `margin_rules` are the shop's per-company/product margin
+    overrides (db.margin_rules), passed in so this module stays DB-free.
     """
     if provider == "auto":
         try_order = _auto_order(api_key)
@@ -71,7 +73,7 @@ def extract(
         started = time.monotonic()
         try:
             bill = info["extract"](image_bytes, mime_type, supplier, api_key)
-            _apply_pricing_defaults(bill)
+            _apply_pricing_defaults(bill, margin_rules)
             # Timing is the whole latency budget of a scan, and which provider
             # actually answered is not otherwise visible once a fallback has
             # kicked in. Line counts, never line contents.
@@ -88,6 +90,8 @@ def extract(
                 # result: a tilted page is the cause, and saying so lets the
                 # shopkeeper fix it instead of hunting for the wrong row.
                 flags=image_prep.skew_flags(image_bytes) + _quality_flags(bill),
+                staff_flags=image_prep.skew_flags(image_bytes) + _staff_flags(bill),
+                check_lines=_uniform_read_lines(bill),
             )
         except Exception as exc:
             # exception(), not warning(): a provider failure is the single most
@@ -124,17 +128,11 @@ def _reconciliation_flags(bill: BillExtraction) -> list[str]:
     discount a line, and a wrong flag costs a glance where a missed misread
     costs a wrong price in the book for good.
     """
-    mismatched = []
-    for article in bill.articles:
-        if article.amount is None or article.amount == 0:
-            continue
-        expected = article.pcs * article.rate
-        slack = max(_RECONCILE_FLOOR, abs(article.amount) * _RECONCILE_TOLERANCE)
-        if abs(expected - article.amount) > slack:
-            mismatched.append(
-                f"{article.product} ({article.pcs} x {article.rate:g} = {expected:g}, "
-                f"bill says {article.amount:g})"
-            )
+    mismatched = [
+        f"{article.product} ({article.pcs} x {article.rate:g} = {article.pcs * article.rate:g}, "
+        f"bill says {article.amount:g})"
+        for article in (bill.articles[i] for i in _mismatched_lines(bill))
+    ]
 
     if not mismatched:
         return []
@@ -142,6 +140,34 @@ def _reconciliation_flags(bill: BillExtraction) -> list[str]:
         f"{len(mismatched)} of {len(bill.articles)} lines don't match the bill's own "
         f"totals — check pcs and price on: {'; '.join(mismatched)}"
     ]
+
+
+def reconciles(pcs: int, rate: float | None, amount: float | None) -> bool | None:
+    """Whether pcs x rate matches the printed amount. None when it can't be told.
+
+    Public because ingest re-asks it after staff correct a line's pcs: a
+    mismatch staff fixed on the review screen needs no owner check.
+    """
+    if rate is None or amount is None or amount == 0:
+        return None
+    slack = max(_RECONCILE_FLOOR, abs(amount) * _RECONCILE_TOLERANCE)
+    return abs(pcs * rate - amount) <= slack
+
+
+def _mismatched_lines(bill: BillExtraction) -> list[int]:
+    """Indexes of lines whose printed amount disagrees with pcs x rate."""
+    return [
+        i for i, a in enumerate(bill.articles) if reconciles(a.pcs, a.rate, a.amount) is False
+    ]
+
+
+def _uniform_read_lines(bill: BillExtraction) -> list[int]:
+    """Every line, when the bill came back as one price on every row.
+
+    That read is internally consistent, so reconciling each line again at
+    ingest would pass it; the owner has to look regardless.
+    """
+    return list(range(len(bill.articles))) if _uniform_read_flags(bill) else []
 
 
 def _uniform_read_flags(bill: BillExtraction) -> list[str]:
@@ -166,7 +192,9 @@ def _uniform_read_flags(bill: BillExtraction) -> list[str]:
     return []
 
 
-def _apply_pricing_defaults(bill: BillExtraction) -> None:
+def _apply_pricing_defaults(
+    bill: BillExtraction, margin_rules: pricing.MarginRules | None = None
+) -> None:
     """Pre-fill tax, margin and selling price on every line.
 
     The shopkeeper used to type all three on each line of every bill. The rule
@@ -177,7 +205,9 @@ def _apply_pricing_defaults(bill: BillExtraction) -> None:
     deliberate and is never overwritten.
     """
     for article in bill.articles:
-        defaults = pricing.defaults_for(article.rate)
+        defaults = pricing.defaults_for(
+            article.rate, article.company, article.product, margin_rules
+        )
         if article.tax_pct is None:
             article.tax_pct = defaults["tax_pct"]
         if article.margin_pct is None:
@@ -212,6 +242,44 @@ def _quality_flags(bill: BillExtraction) -> list[str]:
         flags.append(
             "the AMOUNT column wasn't legible, so prices could not be "
             "cross-checked — verify them against the bill"
+        )
+    return flags
+
+
+def _staff_flags(bill: BillExtraction) -> list[str]:
+    """_quality_flags, worded for staff: no rates, no amounts.
+
+    Every price-bearing warning names the lines to look at and says the owner
+    will check the price, since staff can't see or correct it.
+    """
+    flags: list[str] = []
+    if not bill.bill_no:
+        flags.append("bill_no not detected — enter it manually before saving")
+    if not bill.bill_date:
+        flags.append("bill_date not detected — enter it manually before saving")
+    if not bill.articles:
+        flags.append("no article lines were read — retake the photo straight on")
+
+    if _uniform_read_flags(bill):
+        flags.append(
+            "every line came back at the same price — that is what an unreadable "
+            "photo looks like. Retake it with more light and the page flat."
+        )
+
+    mismatched = _mismatched_lines(bill)
+    if mismatched:
+        names = ", ".join(bill.articles[i].product for i in mismatched)
+        flags.append(
+            f"{len(mismatched)} of {len(bill.articles)} lines don't match the bill's "
+            f"own totals — check the product and pcs on: {names}. If they're right, "
+            "the owner will check the price."
+        )
+
+    unreadable = sum(1 for a in bill.articles if a.amount is None)
+    if bill.articles and unreadable == len(bill.articles):
+        flags.append(
+            "the AMOUNT column wasn't legible, so prices could not be "
+            "cross-checked — the owner will check them"
         )
     return flags
 

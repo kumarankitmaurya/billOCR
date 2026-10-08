@@ -80,12 +80,12 @@ def test_a_new_line_does_not_inherit_a_neighbours_pricing():
 # --- /extract resolves suppliers before it writes anything ----------------
 
 def test_distinct_suppliers_in_first_seen_order():
-    batch = [result("A"), result("B"), result("A")]
+    batch = [result("A").bill, result("B").bill, result("A").bill]
     assert _resolve_suppliers(batch, None) == ["A", "B"]
 
 
 def test_an_explicit_supplier_collapses_the_batch():
-    assert _resolve_suppliers([result("A"), result("B")], "Override") == ["Override"]
+    assert _resolve_suppliers([result("A").bill, result("B").bill], "Override") == ["Override"]
 
 
 # --- Download filename ----------------------------------------------------

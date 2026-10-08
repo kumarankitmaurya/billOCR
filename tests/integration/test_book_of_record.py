@@ -17,31 +17,31 @@ from .conftest import ADMIN_PASSWORD, make_result
 ADMIN = {"X-Admin-Password": ADMIN_PASSWORD}
 
 
-def test_ingest_persists_and_is_idempotent(client, supplier):
+def test_ingest_persists_and_is_idempotent(client, supplier, owner):
     payload = {"results": [make_result()], "supplier": "Dindayal Jalan"}
 
-    first = client.post("/api/bills/ingest", json=payload)
+    first = owner.post("/api/bills/ingest", json=payload)
     assert first.status_code == 200
-    assert first.json() == {"ingested": 1, "suppliers": ["Dindayal Jalan"]}
+    assert first.json() == {"ingested": 1, "suppliers": ["Dindayal Jalan"], "needs_check": 0}
 
     # Re-ingesting the same (supplier, bill_no) replaces its lines. If the
     # ON CONFLICT upsert regressed, this would either duplicate or 500.
-    again = client.post("/api/bills/ingest", json=payload)
+    again = owner.post("/api/bills/ingest", json=payload)
     assert again.status_code == 200
 
     rows = client.get("/api/bills/search", params={"name": "GREEN TEA"}).json()
     assert len(rows) == 1
 
 
-def test_ingest_rejects_missing_bill_no(client, supplier):
+def test_ingest_rejects_missing_bill_no(client, supplier, owner):
     payload = {"results": [make_result(bill_no=None, source_filename="blurry.jpg")]}
-    response = client.post("/api/bills/ingest", json=payload)
+    response = owner.post("/api/bills/ingest", json=payload)
     assert response.status_code == 422
     assert "blurry.jpg" in response.json()["detail"]
 
 
-def test_search_is_case_insensitive_and_filters_on_final_price(client, supplier):
-    client.post("/api/bills/ingest", json={"results": [make_result()]})
+def test_search_is_case_insensitive_and_filters_on_final_price(client, supplier, owner):
+    owner.post("/api/bills/ingest", json={"results": [make_result()]})
 
     # SQLite's LIKE ignored case; Postgres's doesn't, hence ILIKE in db.py.
     assert len(client.get("/api/bills/search", params={"name": "green tea"}).json()) == 1
@@ -52,8 +52,8 @@ def test_search_is_case_insensitive_and_filters_on_final_price(client, supplier)
     assert len(client.get("/api/bills/search", params={"max_final_price": 700}).json()) == 1
 
 
-def test_base_price_is_admin_only(client, supplier):
-    client.post("/api/bills/ingest", json={"results": [make_result()]})
+def test_base_price_is_admin_only(client, supplier, owner):
+    owner.post("/api/bills/ingest", json={"results": [make_result()]})
 
     public = client.get("/api/bills/search", params={"name": "GREEN"}).json()
     assert "rate" not in public[0], "base price must be absent entirely, not null"
@@ -72,7 +72,7 @@ def test_base_price_is_admin_only(client, supplier):
     assert filtered.json() == []
 
 
-def test_workbook_groups_by_company_and_404s_for_unknown_supplier(client, supplier):
+def test_workbook_groups_by_company_and_404s_for_unknown_supplier(client, supplier, owner):
     articles = [
         {
             "company": "JAI MATA DI SRT",
@@ -93,9 +93,9 @@ def test_workbook_groups_by_company_and_404s_for_unknown_supplier(client, suppli
             "final_price": 700.0,
         },
     ]
-    client.post("/api/bills/ingest", json={"results": [make_result(articles=articles)]})
+    owner.post("/api/bills/ingest", json={"results": [make_result(articles=articles)]})
 
-    response = client.get("/api/bills/workbook", params={"supplier": "Dindayal Jalan"})
+    response = owner.get("/api/bills/workbook", params={"supplier": "Dindayal Jalan"})
     assert response.status_code == 200
 
     workbook = load_workbook(io.BytesIO(response.content))
@@ -108,11 +108,11 @@ def test_workbook_groups_by_company_and_404s_for_unknown_supplier(client, suppli
     # tax 10% of 567 = 56.7; margin 20% of the tax-inclusive 623.7 = 124.74
     assert rows[2] == ("GREEN TEA", 4, 567.0, 56.7, 124.74, 748.0)
 
-    missing = client.get("/api/bills/workbook", params={"supplier": "Nobody"})
+    missing = owner.get("/api/bills/workbook", params={"supplier": "Nobody"})
     assert missing.status_code == 404
 
 
-def test_workbook_keeps_bills_separate_per_company(client, supplier):
+def test_workbook_keeps_bills_separate_per_company(client, supplier, owner):
     """Two bills for one company must stay two dated blocks, not merge."""
     first = make_result(bill_no="DJ-1", bill_date="2025-08-17")
     second = make_result(
@@ -130,9 +130,9 @@ def test_workbook_keeps_bills_separate_per_company(client, supplier):
             }
         ],
     )
-    client.post("/api/bills/ingest", json={"results": [first, second]})
+    owner.post("/api/bills/ingest", json={"results": [first, second]})
 
-    response = client.get("/api/bills/workbook", params={"supplier": "Dindayal Jalan"})
+    response = owner.get("/api/bills/workbook", params={"supplier": "Dindayal Jalan"})
     rows = [
         r for r in load_workbook(io.BytesIO(response.content))["JAI MATA DI SRT"].iter_rows(values_only=True)
     ]
@@ -167,7 +167,7 @@ def test_health_stays_open_so_the_platform_can_probe_it(anonymous_client):
     assert anonymous_client.get("/health").status_code == 200
 
 
-def test_search_is_capped_and_pageable(client, supplier):
+def test_search_is_capped_and_pageable(client, supplier, owner):
     """A search with no filters used to return every line ever ingested."""
     from app import db
 
@@ -176,7 +176,7 @@ def test_search_is_capped_and_pageable(client, supplier):
          "tax_pct": None, "margin_pct": None, "final_price": 200.0 + n}
         for n in range(5)
     ]
-    client.post("/api/bills/ingest", json={"results": [make_result(articles=articles)]})
+    owner.post("/api/bills/ingest", json={"results": [make_result(articles=articles)]})
 
     assert len(client.get("/api/bills/search", params={"limit": 2}).json()) == 2
     page_one = client.get("/api/bills/search", params={"limit": 2, "offset": 0}).json()

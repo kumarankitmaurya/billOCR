@@ -182,6 +182,35 @@ this system reconciles that; if that's ever undesirable, decide in
 (`rate + margin_amount`) or stay an independent override, and update both
 the UI and this doc together.
 
+### 5a. Staff never see cost
+
+The bill rate is what the shop paid. Staff (APP_PASSWORD only) scan bills and
+set selling prices but must not be able to learn cost, so they get no rate,
+printed amount, tax % or margin % anywhere — tax and margin applied to a
+selling price give the cost straight back. Hiding fields in the UI would not
+do it while the JSON still carried them, so:
+
+- `/preview` stores the full extraction in the `draft` table and returns a
+  staff view built from an allowlist (`_staff_view`), plus a `draft_id`.
+- `/ingest` takes the reviewed lines against the draft (`ref` = line index)
+  and takes rate/tax/margin from the draft, never from staff.
+- A staff line whose price can't be trusted is saved with
+  `line.needs_check`: amount mismatch (re-tested with the reviewed pcs), no
+  legible amount, whole-bill misread, a hand-added row (`rate` NULL), or a
+  price below rate + tax. The owner settles them via `/checks` and
+  `PATCH /lines/{id}`.
+- Flags have a staff wording without numbers (`ocr_strategy._staff_flags`).
+- `/workbook` gives staff product | pc | SP only; `/pricing` gives staff only
+  the price step; `/extract` is owner-only.
+
+### 5b. Per company/product margins
+
+`margin_rule (company, product, margin_pct)`, names stored normalised
+(upper case, single spaces); product `''` covers the whole company. Most
+specific wins: company + product, then company, then the 15/17% tier
+(`pricing.margin_for`). Managed with `scripts/margin_rules.py` — no UI. A rule
+affects new scans only; saved prices are never rewritten.
+
 ---
 
 ## 6. Idempotent ingest, not append-only

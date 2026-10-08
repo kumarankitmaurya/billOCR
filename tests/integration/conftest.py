@@ -72,6 +72,22 @@ def anonymous_client(client):
     return TestClient(app)
 
 
+@pytest.fixture(scope="session")
+def owner(client):
+    """A client carrying the admin password as well: the owner's device.
+
+    Ingesting whole extractions with their rates, and the full workbook, are
+    the owner's; `client` is staff.
+    """
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    return TestClient(
+        app, headers={"X-App-Password": APP_PASSWORD, "X-Admin-Password": ADMIN_PASSWORD}
+    )
+
+
 @pytest.fixture(autouse=True)
 def clean_db(client):
     """Empty every table before each test so they can't leak into each other."""
@@ -79,7 +95,7 @@ def clean_db(client):
 
     with db._connect() as conn:
         conn.execute(
-            "TRUNCATE supplier, company, bill, line RESTART IDENTITY CASCADE"
+            "TRUNCATE supplier, company, bill, line, draft, margin_rule RESTART IDENTITY CASCADE"
         )
     yield
 

@@ -15,10 +15,10 @@ def add(client, name):
     return client.post("/api/bills/suppliers", json={"name": name}, headers=ADMIN)
 
 
-def test_ingest_refuses_a_supplier_that_is_not_in_the_set(client):
+def test_ingest_refuses_a_supplier_that_is_not_in_the_set(client, owner):
     """The whole point: a new spelling is an error, not a new supplier."""
     add(client, "Dindayal Jalan")
-    response = client.post(
+    response = owner.post(
         "/api/bills/ingest",
         json={"results": [make_result(supplier="Dindayal Jalan Textiles Pvt.Ltd")]},
     )
@@ -26,27 +26,27 @@ def test_ingest_refuses_a_supplier_that_is_not_in_the_set(client):
     assert "Unknown supplier" in response.json()["detail"]
 
 
-def test_the_error_names_the_valid_choices(client):
+def test_the_error_names_the_valid_choices(client, owner):
     add(client, "Dindayal Jalan")
-    detail = client.post(
+    detail = owner.post(
         "/api/bills/ingest", json={"results": [make_result(supplier="Typo Traders")]}
     ).json()["detail"]
     assert "Dindayal Jalan" in detail
 
 
-def test_a_known_supplier_still_ingests(client):
+def test_a_known_supplier_still_ingests(client, owner):
     add(client, "Dindayal Jalan")
-    response = client.post("/api/bills/ingest", json={"results": [make_result()]})
+    response = owner.post("/api/bills/ingest", json={"results": [make_result()]})
     assert response.status_code == 200
     assert response.json()["suppliers"] == ["Dindayal Jalan"]
 
 
-def test_nothing_is_written_when_one_bill_in_a_batch_is_unknown(client):
+def test_nothing_is_written_when_one_bill_in_a_batch_is_unknown(client, owner):
     """Validated for the whole batch up front. Per-bill checking would commit
     the earlier bills before hitting the bad one — the same half-written-then-
     rejected shape /extract used to have."""
     add(client, "Dindayal Jalan")
-    response = client.post(
+    response = owner.post(
         "/api/bills/ingest",
         json={
             "results": [

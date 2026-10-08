@@ -35,7 +35,16 @@ Four decisions worth recording, because none of them is arithmetic:
     rather than a price; 2020 reads deliberate.
 
 Nothing here is forced on a line. Every value is a default the review screen
-pre-fills and the shopkeeper can overwrite, exactly as before.
+pre-fills and the owner can overwrite.
+
+Per-line margin overrides: a margin rule (db table margin_rule, managed with
+scripts/margin_rules.py) can set the margin for one company's design, or for
+everything a company sells. The most specific match wins:
+
+    (company, product)  ->  (company, any product)  ->  the 15/17% tier
+
+Matching ignores case and repeated spaces, because the names come from OCR
+and "Rohan Fab  SRT" is the same mill as "ROHAN FAB SRT".
 """
 
 import math
@@ -43,8 +52,31 @@ import math
 from app.config import settings
 
 
-def margin_for(rate: float) -> float:
-    """The margin percentage for a line, by its bill rate."""
+# (company, product) -> margin %. product "" means every product of that company.
+MarginRules = dict[tuple[str, str], float]
+
+
+def normalise(name: str | None) -> str:
+    """The form margin rules are matched on: upper case, single-spaced."""
+    return " ".join((name or "").upper().split())
+
+
+def margin_for(
+    rate: float,
+    company: str | None = None,
+    product: str | None = None,
+    rules: MarginRules | None = None,
+) -> float:
+    """The margin percentage for a line.
+
+    A margin rule for this company's product, then for the company as a
+    whole, then the tier by bill rate.
+    """
+    if rules and company:
+        mill = normalise(company)
+        for key in ((mill, normalise(product)), (mill, "")):
+            if key in rules:
+                return rules[key]
     return (
         settings.margin_pct_below
         if rate < settings.margin_threshold
@@ -102,10 +134,15 @@ def sell_price(rate: float, tax_pct: float | None = None, margin_pct: float | No
     return landed
 
 
-def defaults_for(rate: float) -> dict:
+def defaults_for(
+    rate: float,
+    company: str | None = None,
+    product: str | None = None,
+    rules: MarginRules | None = None,
+) -> dict:
     """Everything the review screen needs to pre-fill one line."""
     tax = settings.default_tax_pct
-    margin = margin_for(rate)
+    margin = margin_for(rate, company, product, rules)
     return {
         "tax_pct": tax,
         "margin_pct": margin,
@@ -130,3 +167,12 @@ def policy() -> dict:
         "sell_price_nudge_above": settings.sell_price_nudge_above,
         "sell_price_ugly_step": settings.sell_price_ugly_step,
     }
+
+
+def staff_policy() -> dict:
+    """What staff need to price a line: only the step the -/+ buttons move by.
+
+    Not the tiers or the tax. Margin and tax applied to a known selling
+    price give the cost straight back, and cost is what staff must not see.
+    """
+    return {"price_step": settings.sell_price_round_to}

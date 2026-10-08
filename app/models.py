@@ -78,3 +78,32 @@ class ExtractionResult(BaseModel):
         default_factory=list,
         description="Data-quality warnings the caller should surface, e.g. a missing bill_no/date",
     )
+    # The same warnings with no prices in them, for staff. "5 x 1792 = 8960,
+    # bill says 7295" tells whoever reads it what the shop paid.
+    staff_flags: list[str] = Field(default_factory=list)
+    # Indexes into bill.articles that the owner must check whatever staff do
+    # on the review screen (an unreadable photo reads every line the same).
+    check_lines: list[int] = Field(default_factory=list)
+
+
+class StoredLine(BaseModel):
+    """One line as it is written to the book, after review.
+
+    Not Article: Article's field descriptions are the extraction prompt, and
+    two of these differ from it on purpose. `rate` can be unknown — a row
+    staff added by hand has no cost until the owner fills it in — and
+    `needs_check` is a review outcome, not something read off a bill.
+    """
+
+    company: str
+    product: str
+    pcs: int
+    rate: float | None
+    final_price: float | None = None
+    margin_pct: float | None = None
+    tax_pct: float | None = None
+    needs_check: bool = False
+
+    @classmethod
+    def from_article(cls, article: Article) -> "StoredLine":
+        return cls.model_validate(article.model_dump())

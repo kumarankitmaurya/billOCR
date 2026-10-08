@@ -25,6 +25,10 @@ lets it be hand-overridden independently of tax_pct/margin_pct (see
 app/models.py). Any of the three is left blank if its underlying field
 wasn't set — these are shop-internal pricing decisions never read off the
 bill itself.
+
+Staff get a stripped copy (include_cost=False): product | pc | SP only. The
+bill price is the shop's cost, and tax and margin turn SP straight back into
+it, so all three stay in the owner's copy.
 """
 
 import io
@@ -72,7 +76,8 @@ def _safe_sheet_title(name: str, used: set[str]) -> str:
 def _write_company_sheet(
     sheet: Worksheet,
     company_name: str,
-    bills: list[tuple[str, str, list[tuple[str, int, float, float | None, float | None, float | None]]]],
+    bills: list[tuple[str, str, list[tuple[str, int, float | None, float | None, float | None, float | None]]]],
+    include_cost: bool = True,
 ) -> None:
     label_written = False
     for bill_no, bill_date, lines in bills:
@@ -80,13 +85,24 @@ def _write_company_sheet(
         sheet.cell(row=sheet.max_row, column=1).font = Font(bold=True)
 
         if not label_written:
-            sheet.append([company_name, "pc", "price", "tax", "margin", "SP"])
+            labels = ["pc", "price", "tax", "margin", "SP"] if include_cost else ["pc", "SP"]
+            sheet.append([company_name, *labels])
             sheet.cell(row=sheet.max_row, column=1).font = Font(italic=True)
             label_written = True
 
         for product, pcs, rate, final_price, margin_pct, tax_pct in lines:
-            tax_amount = round(rate * tax_pct / 100, 2) if tax_pct is not None else None
-            margin_amount = round((rate + (tax_amount or 0)) * margin_pct / 100, 2) if margin_pct is not None else None
+            if not include_cost:
+                sheet.append([product, pcs, final_price])
+                continue
+            # rate is None on a line staff added by hand that the owner hasn't
+            # priced yet; tax and margin amounts can't be worked out without it.
+            known = rate is not None
+            tax_amount = round(rate * tax_pct / 100, 2) if known and tax_pct is not None else None
+            margin_amount = (
+                round((rate + (tax_amount or 0)) * margin_pct / 100, 2)
+                if known and margin_pct is not None
+                else None
+            )
             sheet.append([product, pcs, rate, tax_amount, margin_amount, final_price])
 
         sheet.append([])  # blank separator between bills
@@ -94,7 +110,7 @@ def _write_company_sheet(
     _autofit(sheet)
 
 
-def build_supplier_workbook(supplier_name: str) -> io.BytesIO:
+def build_supplier_workbook(supplier_name: str, include_cost: bool = True) -> io.BytesIO:
     """Build the supplier's full book from the DB and return it as a buffer.
 
     Nothing is written to disk. The workbook is a pure view over the book of
@@ -113,7 +129,7 @@ def build_supplier_workbook(supplier_name: str) -> io.BytesIO:
     used_titles: set[str] = set()
     for company_name, bills in data.items():
         sheet = workbook.create_sheet(_safe_sheet_title(company_name, used_titles))
-        _write_company_sheet(sheet, company_name, bills)
+        _write_company_sheet(sheet, company_name, bills, include_cost)
 
     buffer = io.BytesIO()
     workbook.save(buffer)

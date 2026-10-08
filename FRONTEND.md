@@ -90,43 +90,75 @@ GET  /api/bills/providers
      Populates the provider dropdown; "available" reflects whether the
      server has that provider's API key configured.
 
-POST /api/bills/preview          (multipart/form-data)
+Two roles. Staff send X-App-Password only. The owner also sends
+X-Admin-Password (billOCR-ui does, on every request, once Search has verified
+it). Staff never receive the bill rate (the shop's cost), the printed amount,
+tax % or margin % — not hidden in the UI, absent from the JSON.
+
+POST /api/bills/preview          (multipart/form-data)   header: X-Admin-Password?
      fields: files[] (image files), supplier? (string), api_key? (string),
-             provider? ("auto"|"gemini"|"groq", default "auto")
+             provider? ("auto"|"groq", default "auto")
      -> ExtractionResult[]
         {
+          draft_id: string,             // the scan, held server-side
           source_filename: string,
-          engine: "gemini" | "groq",
+          engine: "groq",
           bill: {
             supplier: string,
             bill_no: string | null,
             bill_date: string | null,   // "YYYY-MM-DD"
-            articles: [ { company: string, product: string, pcs: int, rate: float,
-                          tax_pct: float | null, margin_pct: float | null,
-                          final_price: float | null } ]
+            articles: [ { ref: int, company: string, product: string, pcs: int,
+                          final_price: float | null,
+                          // owner only — keys absent for staff:
+                          rate: float, amount: float | null,
+                          tax_pct: float | null, margin_pct: float | null } ]
           },
-          flags: string[]               // bill-level, e.g. "missing bill_no"
+          flags: string[]               // staff get a wording with no prices in it
         }
-     Runs OCR only — nothing is persisted. `supplier`, if given, is trusted
-     context (not read off the image); if omitted, each bill's supplier
-     comes from the OCR result instead.
+     Runs OCR and holds the full result as a draft (kept 7 days unsaved);
+     nothing goes into the book. final_price arrives pre-filled from the
+     pricing rule, with any per-company/product margin rule applied.
 
-POST /api/bills/ingest           (application/json)
-     body: { results: ExtractionResult[], supplier?: string }
-     -> { ingested: number, suppliers: string[] }
-     422 if any result is missing bill_no or bill_date — those are the DB's
+POST /api/bills/ingest           (application/json)      header: X-Admin-Password?
+     body: { drafts: [ { draft_id, bill_no, bill_date,
+                         articles: [ { ref: int | null, company, product, pcs,
+                                       final_price, rate?, tax_pct?, margin_pct? } ] } ],
+             supplier?: string }
+     -> { ingested: number, suppliers: string[], needs_check: number }
+     Each row is laid over the draft line `ref` points at, which is where its
+     rate comes from; ref null is a row added by hand (no rate). rate/tax/
+     margin in the body are applied for the owner and ignored from staff.
+     A staff line is saved marked needs_check when its price can't be
+     trusted: pcs x rate doesn't match the printed amount (re-tested with the
+     reviewed pcs), no legible amount, a whole-bill misread, no rate, or a
+     selling price below rate + tax. `needs_check` counts them; staff aren't
+     told which reason applied. 410 for an unknown or expired draft_id.
+     `{results: ExtractionResult[]}` (whole extractions with rates) is still
+     accepted, owner only (403 for staff).
+     422 if any bill is missing bill_no or bill_date — those are the DB's
      idempotency/sort key, never guessed. Re-ingesting the same
      (supplier, bill_no) replaces its lines rather than duplicating them.
 
-GET  /api/bills/workbook?supplier=<name>
+GET  /api/bills/pricing          header: X-Admin-Password?
+     -> owner: the whole rule (tiers, tax, rounding); staff: { price_step }
+
+GET  /api/bills/checks           admin only
+     -> [ { id, supplier, company, product, bill_no, bill_date, pcs,
+            rate: float | null, tax_pct, margin_pct, final_price } ]
+PATCH /api/bills/lines/{id}      admin only
+     body: any of { rate, tax_pct, margin_pct, final_price }
+     -> { id, needs_check: bool }   // stays true while the line has no rate
+
+GET  /api/bills/workbook?supplier=<name>                  header: X-Admin-Password?
      -> streams <name>.xlsx (application/vnd.openxmlformats-...sheet)
+     Owner: the full book. Staff: product | pc | SP only.
      Rebuilds the workbook from the DB on every call and streams it; nothing
      is written server-side (the service keeps no files on disk). 404 if the
      supplier has no ingested bills. The Content-Disposition filename is
      quoted and RFC 5987-encoded, so supplier names with spaces survive.
 
 POST /api/bills/extract          (multipart/form-data) — convenience only,
-                                  not used by billOCR-ui
+                                  not used by billOCR-ui; admin only
      fields: files[], supplier?, api_key?, provider?
      -> streams the workbook directly: OCR + ingest + workbook in one call.
      400 if the batch resolves to more than one supplier without an
@@ -149,10 +181,9 @@ GET  /api/bills/search           header: X-Admin-Password? (string)
 ```
 
 Notes:
-- `tax_pct`/`margin_pct`/`final_price` are always `null` straight out of OCR
-  — none is printed on the bill (see output-format.md). All three are filled
-  in on the review screen and flow through to `/ingest` in the same
-  `ExtractionResult[]` shape as every other edit — no separate endpoint.
+- `tax_pct`/`margin_pct`/`final_price` are never printed on the bill (see
+  output-format.md); the server pre-fills them from the pricing rule
+  (app/services/pricing.py) and margin rules (scripts/margin_rules.py).
   `final_price` is mandatory before the review screen will let you save —
   enforced client-side only (billOCR-ui disables its save button; there is
   no corresponding backend 422 for it, unlike bill_no/bill_date below). At
@@ -189,17 +220,13 @@ shopkeeper catches it — implemented in billOCR-ui as follows:
   is editable too, as a bulk rename — editing the group header renames every
   row in that group at once, so a misread mill name doesn't fork into a
   wrong sheet.
-- Inline-edit `product`, `pcs`, `rate`, plus three shop-only pricing fields
-  per line, in order: `tax_pct`, `margin_pct`, `final_price` (percents, never
-  the raw amounts — the backend separately computes those at export time,
-  see §3 notes). All three start blank; OCR never fills them. Entering
-  `tax_pct` and/or `margin_pct` computes a default `final_price` client-side
-  as `rate * (1 + tax_pct/100) * (1 + margin_pct/100)` (a missing percent is
-  treated as 0) — but `final_price` stays a plain, independently-editable
-  field after that: hand-adjusting it doesn't change `tax_pct`/`margin_pct`,
-  and it isn't recomputed unless one of them is edited again. Same
-  compute-a-default-then-hand-adjust pattern as the book's own tax/margin/SP
-  columns (output-format.md), not a live formula. `final_price` is
+- Staff inline-edit `product`, `pcs` and the selling price — typed, or
+  nudged with −/+ to the next multiple of `price_step`. No rate, tax or
+  margin: the row is in owner mode only when the data carries `rate`.
+- The owner also edits `rate`, `tax_pct` and `margin_pct`; editing them
+  recomputes `final_price` through the same rule the server uses
+  (src/lib/pricing.ts), and `final_price` stays independently editable
+  after that. `final_price` is
   **mandatory** — the Save & Download button stays disabled, with a banner
   giving the count still blank, until every line on every bill in the batch
   has one (client-side only; see §3 notes). Numeric keypad for all five on
@@ -216,9 +243,10 @@ shopkeeper catches it — implemented in billOCR-ui as follows:
   of the real validation, not a replacement for it.
 - Row actions: delete a spurious row, add a missed one, add a whole new
   company group.
-- Edited results still `POST /api/bills/ingest` in the same
-  `ExtractionResult[]` shape from §3 — there is no separate `/confirm`
-  endpoint, and none should be invented.
+- Edited results `POST /api/bills/ingest` as drafts (§3) — there is no
+  separate `/confirm` endpoint, and none should be invented. Done says how
+  many lines went to the owner for a price check.
+- The owner settles those on the Price checks screen (Search → Admin).
 - The source image is **not** shown beside the grid — there is no
   redacted-image endpoint (see §3 notes), and until redaction ships
   billOCR-ui clears the raw upload from client state the instant OCR

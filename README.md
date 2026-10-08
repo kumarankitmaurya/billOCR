@@ -141,8 +141,12 @@ graph LR
 
 - `GET /api/bills/providers` — which OCR providers are configured, for the UI dropdown.
 - `POST /api/bills/preview` — multipart form (`files`, optional `supplier`, `api_key`, `provider`) → JSON array of extracted bills. Runs no persistence.
-- `POST /api/bills/ingest` — JSON body `{results, supplier}` (`results` from `/preview`) → persists into the book of record, returns `{ingested, suppliers}`.
-- `GET /api/bills/workbook?supplier=NAME` → streams that supplier's full `.xlsx`, rebuilt from the database.
+- `POST /api/bills/ingest` — JSON body `{drafts, supplier}` (reviewed lines against each `/preview` `draft_id`) → persists into the book of record, returns `{ingested, suppliers, needs_check}`. Staff never send or receive rates; doubtful staff lines are saved for the owner to check.
+- `GET /api/bills/checks`, `PATCH /api/bills/lines/{id}` — admin only: lines waiting for a price check, and settling one.
+- `GET /api/bills/pricing` — the full pricing rule for admin, only the price step for staff.
+- `GET /api/bills/workbook?supplier=NAME` → streams that supplier's `.xlsx`, rebuilt from the database. Admin gets the full book; staff get product | pc | SP only.
+
+Per-company/product margins: `python scripts/margin_rules.py set "ROHAN FAB SRT" "MILK CAKE" 20` (or `set COMPANY PCT` for a whole company; also `list`, `remove`, `import rules.csv`). See ARCHITECTURE.md §5b.
 - `GET /api/bills/search` — query `name`/`min_final_price`/`max_final_price` (everyone) and `min_base_price`/`max_base_price` (admin only) → matching lines across every supplier. Send header `X-Admin-Password: <ADMIN_PASSWORD>` to also get `rate` (base price) back per result — omitted entirely otherwise. 401 on a wrong password, 403 if a base-price filter is sent without one.
 - `POST /api/bills/extract` — multipart form, same as `/preview` plus ingestion → streams the resulting workbook directly. One-shot convenience path for scripts; requires the batch to resolve to exactly one supplier.
 

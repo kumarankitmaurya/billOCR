@@ -15,15 +15,18 @@ Two consequences are load-bearing below:
 
 import logging
 import time
+import uuid
 from collections import deque
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import psycopg
+from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from app.config import settings
-from app.models import Article, BillExtraction
+from app.models import BillExtraction, ExtractionResult, StoredLine
+from app.services.pricing import MarginRules, normalise
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +78,28 @@ _SCHEMA = [
     # are joined on for every workbook build and every search.
     "CREATE INDEX IF NOT EXISTS line_bill_id_idx ON line (bill_id)",
     "CREATE INDEX IF NOT EXISTS line_company_id_idx ON line (company_id)",
+    # A scan between /preview and /ingest. Held here, not round-tripped
+    # through the browser, because the full extraction carries the bill rate
+    # — the shop's cost — and staff must not be able to read it, even in the
+    # network tab. gen_random_uuid() is built in from Postgres 13.
+    """
+    CREATE TABLE IF NOT EXISTS draft (
+        id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+        created_at timestamptz NOT NULL DEFAULT now(),
+        payload jsonb NOT NULL
+    )
+    """,
+    # Margin overrides by company and design; product '' covers the whole
+    # company. Names are stored normalised (see pricing.normalise) so a
+    # lookup is an exact match. Managed with scripts/margin_rules.py.
+    """
+    CREATE TABLE IF NOT EXISTS margin_rule (
+        company text NOT NULL,
+        product text NOT NULL DEFAULT '',
+        margin_pct double precision NOT NULL,
+        PRIMARY KEY (company, product)
+    )
+    """,
 ]
 
 # Columns added after the initial release. `ADD COLUMN IF NOT EXISTS` makes
@@ -88,7 +113,19 @@ _LINE_MIGRATIONS = [
     # billOCR-visual service, which stores them in object storage.
     "photo_path text",
     "photo_caption text",
+    # Set when a line's price could not be trusted at save time and the owner
+    # has to look at it (see routers/bills.py _needs_check).
+    "needs_check boolean NOT NULL DEFAULT false",
 ]
+
+# Other schema changes to existing columns, each idempotent.
+_ALTERATIONS = [
+    # A row staff add by hand has no known cost until the owner fills it in.
+    "ALTER TABLE line ALTER COLUMN rate DROP NOT NULL",
+]
+
+# Drafts nobody saved are dropped after this long.
+DRAFT_TTL_DAYS = 7
 
 # Arbitrary but fixed: serialises schema creation so two instances starting
 # together can't race on CREATE TABLE/INDEX.
@@ -202,6 +239,8 @@ def init_db() -> None:
                 conn.execute(statement)
             for column_def in _LINE_MIGRATIONS:
                 conn.execute(f"ALTER TABLE line ADD COLUMN IF NOT EXISTS {column_def}")
+            for statement in _ALTERATIONS:
+                conn.execute(statement)
     logger.info("init_db finished in %.2fs", time.monotonic() - started)
 
 
@@ -299,12 +338,20 @@ def _existing_pricing(
     return preserved
 
 
-def ingest_bill(supplier_name: str, bill: BillExtraction) -> None:
+def ingest_bill(
+    supplier_name: str, bill: BillExtraction, lines: list[StoredLine] | None = None
+) -> None:
     """Persist one extracted bill, idempotently keyed by (supplier, bill_no).
+
+    `lines` replaces bill.articles when given — the reviewed lines, which may
+    have no known rate and may be marked for the owner to check. Without it
+    the bill's own articles are written as they are.
 
     Re-ingesting the same bill replaces its lines, but carries forward any
     hand-entered pricing the payload doesn't supply — see _existing_pricing.
     """
+    if lines is None:
+        lines = [StoredLine.from_article(article) for article in bill.articles]
     with _connect() as conn:
         supplier_id = _supplier_id(conn, supplier_name)
         bill_id = _upsert_bill(conn, supplier_id, bill.bill_no, bill.bill_date)
@@ -312,12 +359,13 @@ def ingest_bill(supplier_name: str, bill: BillExtraction) -> None:
         preserved = _existing_pricing(conn, bill_id)
         conn.execute("DELETE FROM line WHERE bill_id = %s", (bill_id,))
 
-        for order, article in enumerate(bill.articles):
+        for order, article in enumerate(lines):
             company_id = _get_or_create_company(conn, supplier_id, article.company)
             final_price, margin_pct, tax_pct = _merge_pricing(article, preserved)
             conn.execute(
                 "INSERT INTO line (bill_id, company_id, product, pcs, rate, line_order, "
-                "final_price, margin_pct, tax_pct) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                "final_price, margin_pct, tax_pct, needs_check) "
+                "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                 (
                     bill_id,
                     company_id,
@@ -328,12 +376,13 @@ def ingest_bill(supplier_name: str, bill: BillExtraction) -> None:
                     final_price,
                     margin_pct,
                     tax_pct,
+                    article.needs_check,
                 ),
             )
 
 
 def _merge_pricing(
-    article: Article,
+    article: StoredLine,
     preserved: dict[tuple[str, str], deque[tuple[float | None, float | None, float | None]]],
 ) -> tuple[float | None, float | None, float | None]:
     """Payload pricing wins; anything it leaves null falls back to what was stored.
@@ -493,3 +542,120 @@ def search_lines(
         }
         for supplier, company, product, bill_no, bill_date, pcs, rate, final_price in rows
     ]
+
+
+# --- Drafts ---------------------------------------------------------------
+
+def save_draft(result: ExtractionResult) -> str:
+    """Hold a scan until it is saved, returning the id the client refers to it by.
+
+    Old drafts are dropped on the way in rather than by a scheduled job: the
+    service scales to zero and has nothing to run one on.
+    """
+    with _connect() as conn:
+        conn.execute(
+            "DELETE FROM draft WHERE created_at < now() - make_interval(days => %s)",
+            (DRAFT_TTL_DAYS,),
+        )
+        row = conn.execute(
+            "INSERT INTO draft (payload) VALUES (%s) RETURNING id",
+            (Jsonb(result.model_dump(mode="json")),),
+        ).fetchone()
+    return str(row[0])
+
+
+def load_draft(draft_id: str) -> ExtractionResult | None:
+    """The scan behind a draft id, or None if it expired or never existed."""
+    try:
+        key = uuid.UUID(draft_id)
+    except ValueError:
+        # Not a uuid at all — the same answer as an unknown one.
+        return None
+    with _connect() as conn:
+        row = conn.execute("SELECT payload FROM draft WHERE id = %s", (key,)).fetchone()
+    return ExtractionResult.model_validate(row[0]) if row else None
+
+
+# --- Margin rules ---------------------------------------------------------
+
+def margin_rules() -> MarginRules:
+    """Every margin override, keyed the way pricing.margin_for looks them up."""
+    with _connect() as conn:
+        rows = conn.execute("SELECT company, product, margin_pct FROM margin_rule").fetchall()
+    return {(company, product): pct for company, product, pct in rows}
+
+
+def set_margin_rule(company: str, product: str | None, margin_pct: float) -> None:
+    """Add or replace one override. No product means every product of the company."""
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO margin_rule (company, product, margin_pct) VALUES (%s, %s, %s) "
+            "ON CONFLICT (company, product) DO UPDATE SET margin_pct = EXCLUDED.margin_pct",
+            (normalise(company), normalise(product), margin_pct),
+        )
+
+
+def remove_margin_rule(company: str, product: str | None) -> bool:
+    """Drop one override. True if there was one to drop."""
+    with _connect() as conn:
+        row = conn.execute(
+            "DELETE FROM margin_rule WHERE company = %s AND product = %s RETURNING company",
+            (normalise(company), normalise(product)),
+        ).fetchone()
+    return row is not None
+
+
+# --- Lines waiting for the owner ------------------------------------------
+
+def list_checks() -> list[dict]:
+    """Every line marked needs_check, most recent bill first."""
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT line.id, supplier.name, company.name, line.product, bill.bill_no,
+                   bill.bill_date, line.pcs, line.rate, line.tax_pct, line.margin_pct,
+                   line.final_price
+            FROM line
+            JOIN bill ON line.bill_id = bill.id
+            JOIN company ON line.company_id = company.id
+            JOIN supplier ON bill.supplier_id = supplier.id
+            WHERE line.needs_check
+            ORDER BY bill.bill_date DESC, bill.id DESC, line.line_order
+            """
+        ).fetchall()
+    keys = (
+        "id", "supplier", "company", "product", "bill_no", "bill_date",
+        "pcs", "rate", "tax_pct", "margin_pct", "final_price",
+    )
+    return [dict(zip(keys, row)) for row in rows]
+
+
+# The line columns the owner may correct from the checks list.
+CHECKABLE_FIELDS = ("rate", "tax_pct", "margin_pct", "final_price")
+
+
+def resolve_check(line_id: int, changes: dict[str, float | None]) -> bool | None:
+    """Apply the owner's corrections to a line and clear its needs_check.
+
+    None if there is no such line. Otherwise whether it is now resolved: a
+    line still without a rate stays marked, because a book line with no cost
+    is exactly what the mark is for.
+
+    Field names are checked against CHECKABLE_FIELDS before they reach the
+    SQL, since they are interpolated, not bound.
+    """
+    fields = [name for name in CHECKABLE_FIELDS if name in changes]
+    assignments = [f"{name} = %s" for name in fields]
+    params: list = [changes[name] for name in fields]
+    if "rate" in changes:
+        # SET expressions see the row as it was, so a new rate is judged here.
+        assignments.append("needs_check = %s")
+        params.append(changes["rate"] is None)
+    else:
+        assignments.append("needs_check = rate IS NULL")
+    with _connect() as conn:
+        row = conn.execute(
+            f"UPDATE line SET {', '.join(assignments)} WHERE id = %s RETURNING needs_check",
+            [*params, line_id],
+        ).fetchone()
+    return None if row is None else not row[0]

@@ -58,7 +58,7 @@ def _run(sqlite_path: Path, *extra: str) -> subprocess.CompletedProcess:
     )
 
 
-def test_migration_copies_rows_with_ids_and_resets_sequences(client, tmp_path):
+def test_migration_copies_rows_with_ids_and_resets_sequences(client, tmp_path, owner):
     sqlite_path = tmp_path / "bills.db"
     _build_sqlite(sqlite_path)
 
@@ -92,15 +92,15 @@ def test_migration_copies_rows_with_ids_and_resets_sequences(client, tmp_path):
     assert added.status_code == 201, added.text
 
     new = make_result(supplier="New Supplier", bill_no="NS-1")
-    response = client.post("/api/bills/ingest", json={"results": [new]})
+    response = owner.post("/api/bills/ingest", json={"results": [new]})
     assert response.status_code == 200, response.text
 
-    workbook = client.get("/api/bills/workbook", params={"supplier": "Dindayal Jalan"})
+    workbook = owner.get("/api/bills/workbook", params={"supplier": "Dindayal Jalan"})
     assert workbook.status_code == 200
 
 
-def test_migration_refuses_a_non_empty_target(client, supplier, tmp_path):
-    client.post("/api/bills/ingest", json={"results": [make_result()]})
+def test_migration_refuses_a_non_empty_target(client, supplier, tmp_path, owner):
+    owner.post("/api/bills/ingest", json={"results": [make_result()]})
 
     sqlite_path = tmp_path / "bills.db"
     _build_sqlite(sqlite_path)
